@@ -13,9 +13,10 @@ connected_clients = {}
 pool = None
 
 SERVER_IP = "127.0.0.1"
+
 DB_NAME = "ccsschatapp"
-DB_USER = "root"
-DB_PASS = "root"
+DB_USER = "client1"
+DB_PASS = "pZL8giwz9vgvA3PuU4n"
 DB_HOST = "127.0.0.1"
 DB_PORT = 3306
 
