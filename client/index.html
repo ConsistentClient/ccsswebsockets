@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat Client</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            height: 100vh;
+        }
+
+        #sidebar {
+            width: 220px;
+            background: #f4f4f4;
+            border-right: 1px solid #ccc;
+            padding: 10px;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+
+        #sidebar h3 {
+            margin-top: 0;
+        }
+
+        .room {
+            padding: 8px;
+            margin-bottom: 5px;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+
+        .room:hover {
+            background: #ddd;
+        }
+
+        .room.active {
+            background: #bbb;
+            font-weight: bold;
+        }
+
+        #main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+        }
+
+        #messages {
+            flex: 1;
+            border: 1px solid #ccc;
+            padding: 10px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+        }
+
+        #inputRow {
+            display: flex;
+            gap: 5px;
+        }
+
+        #messageInput {
+            flex: 1;
+            padding: 5px;
+        }
+    </style>
+</head>
+
+<body>
+    <div>
+        <button onclick="CreateRoom()">Create Room</button>
+        <button onclick="GetListOfRooms()">Get Rooms</button>
+    </div>
+
+    <div id="sidebar">
+        <h3>Rooms</h3>
+        <div id="rooms"></div>
+    </div>
+
+    <div id="main">
+        <h3>Chat</h3>
+
+        <!-- User list -->
+        <div id="users" style="border:1px solid #ccc; padding:8px; margin-bottom:10px; background:#f9f9f9;">
+            <strong>Users in Room</strong>
+            <div id="userList"></div>
+        </div>
+
+        <!-- Messages -->
+        <div id="messages"></div>
+
+        <!-- Input -->
+        <div id="inputRow">
+            <input type="text" id="messageInput" placeholder="Type a message">
+            <button onclick="sendMessage()">Send</button>
+        </div>
+    </div>
+</body>
+
+</html>
+
+<script>
+    let ws;
+    let currentRoomId = null;
+    let session_token = null;
+    let rooms = null;
+    let username = prompt("Enter your username:", "1234");
+
+    function connect() {
+        ws = new WebSocket("ws://127.0.0.1:8080");
+
+        ws.onopen = () => {
+            console.log("Connected to server.");
+            // Send registration with username
+            ws.send(JSON.stringify({
+                event: "Register",
+                user_id: username
+            }));
+        };
+
+        ws.onmessage = (msgEvent) => {
+
+            const msg = JSON.parse(msgEvent.data);
+            const { event, data } = msg;
+
+            if (event === "register_error") {
+                alert("Failed registration");
+            }
+            else if (event === "register_success") {
+                alert("Registration Success");
+                session_token = data;
+            }
+            else if (event === "get_rooms_failed") {
+                alert("Failed GetRoomsFailed");
+            }
+            else if (event === "get_rooms") {
+                rooms = data;
+                renderRooms(rooms);
+            }
+            else if (event === "chat_message") {
+                if (data.room === currentRoomId) {
+                    addMessage(data.username, atob( data.message ), data.msginfo);
+                }
+            }
+            else if (event == "messages_in_room") {
+                list_msgs = data;
+                list_msgs.forEach((msg) => {
+                    if (msg.room_id === currentRoomId) {
+                        addMessage(msg.username, atob( msg.message ));
+                    }
+                })
+            }
+            else if (event === "room_users") {
+                renderUsers(data); // server should return array of {id, name}
+            }
+            else if (event === "update_or_make_room") {
+                if( data.status == "success")
+                    alert("Room created");
+                else 
+                    alert( "Room failed " + data.msg );
+            }
+            else {
+                console.log("Received message:", msg);
+            }
+        };
+
+        ws.onclose = () => console.log("Disconnected.");
+        ws.onerror = (err) => console.error("WebSocket error:", err);
+    }
+
+    // Send message with token for authentication
+    function sendMessage() {
+        if (!session_token) {
+            alert("You must be registered first!");
+            return;
+        }
+
+        const input = document.getElementById("messageInput");
+        const message = input.value.trim();
+        if (!message || !currentRoomId || !session_token) return;
+
+        ws.send(JSON.stringify({
+            event: `BroadcastMessage`,
+            data: {
+                "session_token": session_token,
+                "room": currentRoomId,
+                "message": btoa(message),
+                "msginfo": btoa(JSON.stringify({})),
+            }
+        }));
+
+        addMessage("Me", message);
+        input.value = "";
+    }
+
+    // Create a new room with token
+    function GetListOfRooms() {
+        if (!session_token) {
+            alert("You must be registered first!");
+            return;
+        }
+
+        ws.send(JSON.stringify({
+            event: "GetRooms",
+            data: {
+                "session_token": session_token
+            }
+        }));
+    }
+
+    function CreateRoom() {
+        if (!session_token) {
+            alert("You must be registered first!");
+            return;
+        }
+
+        let name = prompt("Enter room name:", "Room 1");
+        ws.send(JSON.stringify({
+            event: "UpdateOrMakeRoom",
+            data: {
+                "session_token": session_token,
+                "name": name,
+                "users": ["user1", "user2"],
+                "description": "This is a new room " + name
+            }
+        }));
+    }
+
+    function renderUsers(users) {
+        const container = document.getElementById("userList");
+        container.innerHTML = "";
+
+        if (!users || users.length === 0) {
+            container.innerHTML = "<em>No users in this room</em>";
+            return;
+        }
+
+        users.forEach(user => {
+            const div = document.createElement("div");
+            div.textContent = user.id + "-" + user.username;
+            container.appendChild(div);
+        });
+    }
+
+    // Render the room list in sidebar
+    function renderRooms(rooms) {
+        const container = document.getElementById("rooms");
+        container.innerHTML = "";
+
+        rooms.forEach(room => {
+            const div = document.createElement("div");
+            div.className = "room";
+            if (room.last_message_seen > 0)
+                div.textContent = "*" + room.name;
+            else
+                div.textContent = room.name;
+            div.onclick = () => selectRoom(room.id, div);
+            container.appendChild(div);
+        });
+    }
+
+    function selectRoom(roomId, div) {
+        currentRoomId = roomId;
+        document.querySelectorAll(".room").forEach(r => r.classList.remove("active"));
+        div.classList.add("active");
+
+        document.getElementById("messages").innerHTML = "";
+        document.getElementById("userList").innerHTML = "";
+        addMessage("System", `Joined room ${roomId}`);
+
+        // Ask server for users in this room
+        ws.send(JSON.stringify({
+            event: "GetUsersInRoom",
+            data: {
+                "session_token": session_token,
+                "room": roomId
+            }
+        }));
+
+        ws.send(JSON.stringify({
+            event: "GetMessagesInRoom",
+            data: {
+                "session_token": session_token,
+                "room": roomId,
+                "last_id": 0
+            }
+        }));
+
+    }
+
+
+    // Add message to chat window
+    function addMessage(sender, text) {
+        const container = document.getElementById("messages");
+        const div = document.createElement("div");
+        div.textContent = `${sender}: ${text}`;
+        container.appendChild(div);
+        container.scrollTop = container.scrollHeight;
+    }
+
+    connect();
+</script>

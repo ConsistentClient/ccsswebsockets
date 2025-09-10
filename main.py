@@ -6,154 +6,492 @@ from aiohttp import web
 import websockets
 import mysql.connector
 import aiomysql
+from functools import partial
+import secrets
 
 connected_clients = {}
+pool = None
+
+SERVER_IP = "127.0.0.1"
+DB_NAME = "ccsschatapp"
+DB_USER = "root"
+DB_PASS = "root"
+DB_HOST = "127.0.0.1"
+DB_PORT = 3306
+
+
+async def init_db():
+    # Connect without specifying DB (to check/create DB)
+    conn = await aiomysql.connect(
+        host=DB_HOST, port=DB_PORT,
+        user=DB_USER, password=DB_PASS
+    )
+    async with conn.cursor() as cursor:
+        # Check if DB exists
+        await cursor.execute(f"SHOW DATABASES LIKE '{DB_NAME}'")
+        result = await cursor.fetchone()
+        if not result:
+            print(f"Database {DB_NAME} not found. Creating...")
+            await cursor.execute(f"CREATE DATABASE {DB_NAME}")
+        else:
+            print(f"Database {DB_NAME} already exists.")
+    await conn.ensure_closed()
+
+    # Reconnect to the new DB
+    conn = await aiomysql.connect(
+        host=DB_HOST, port=DB_PORT,
+        user=DB_USER, password=DB_PASS,
+        db=DB_NAME
+    )
+    async with conn.cursor() as cursor:
+        # Create tables if not exist
+        await cursor.execute("""
+            CREATE TABLE IF NOT EXISTS room_messages (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                organization_id bigint(20) NOT NULL,
+                room_id INT NOT NULL,
+                user_id bigint(20) unsigned NOT NULL,
+                message TEXT NOT NULL,
+                media_message TEXT NOT NULL,
+                is_deleted tinyint(1) DEFAULT 0,
+                message_information LONGTEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_organization_id (organization_id),
+                INDEX idx_room_id (room_id),
+                INDEX idx_user_id (user_id)
+            )
+        """)
+
+        await cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rooms (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) DEFAULT NULL,
+                status INT DEFAULT 0,
+                image VARCHAR(255) DEFAULT NULL,
+                description TEXT DEFAULT NULL,
+                organization_id bigint(20) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_organization_id (organization_id),
+                INDEX idx_status (status)
+            )
+        """)
+
+        await cursor.execute("""
+            CREATE TABLE IF NOT EXISTS room_participants (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                room_id INT NOT NULL,
+                user_id bigint(20) unsigned NOT NULL,
+                last_message_seen INT, 
+                organization_id INT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_user_id (user_id),
+                INDEX idx_organization_id (organization_id)
+            )
+        """)
+
+
+        await cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(512) DEFAULT "",
+                token VARCHAR(512) NOT NULL,
+                organization_id INT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_token (token),
+                INDEX idx_organization_id (organization_id)
+            )
+        """)
+
+        print("✅ Tables ensured.")
+    await conn.commit()
+    await conn.ensure_closed()
+
 
 async def create_pool():
     pool = await aiomysql.create_pool(
-        host='172.105.19.30',
-        port=3306,
-        user='client1',
-        password='pZL8giwz9vgvA3PuU4n',
-        db='chat_web',
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASS,
+        db=DB_NAME,
         autocommit=True,     # Optional: automatically commit INSERT/UPDATE
         minsize=1,           # Minimum number of connections in the pool
         maxsize=10           # Maximum number of connections
     )
     return pool
 
-async def check_user(pool, username):
+async def get_user_id( username, organization_id ) :
+    global pool
+    print(f"In get_user_id {username}")
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("SELECT * FROM list_users WHERE name = %s", (username,))
+            await cursor.execute("SELECT id FROM clients WHERE username = %s AND organization_id = %s", (username, int(organization_id)))
+            user = await cursor.fetchone()
+            return user['id']  # None if not found, dict if found
+        
+async def check_user(user_id):
+    global pool
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM clients WHERE token = %s", (user_id,))
             user = await cursor.fetchone()
             return user  # None if not found, dict if found
+
+async def is_user_in_room(pool, user_id, room_id, organization_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT id
+                FROM room_participants
+                WHERE user_id = %s AND room_id = %s AND organization_id = %s
+            """, (user_id,room_id, organization_id))
+            if await cursor.fetchone():
+                return True
+            else :
+                return False
 
 async def get_user_rooms(pool, user_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT r.id, r.name, r.description
-                FROM rooms r
-                JOIN room_users ru ON ru.room_id = r.id
+                SELECT r.id, r.name, r.description, ru.last_message_seen
+                FROM rooms r 
+                JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
             """, (user_id,))
             rooms = await cursor.fetchall()
             return rooms
 
+async def store_new_message (pool, user_id, message, msginfo, room_id, organization_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute(" INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information, media_message) VALUES( %s, %s, %s, %s, %s, '')", (room_id, user_id, int( organization_id), message, msginfo))       
+            msg_id = cursor.lastrowid
+            return msg_id
 
-async def create_or_update_room(pool, room_name, user_ids, description, organization_id):
+
+async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                FROM room_messages m
+                JOIN clients u ON m.user_id = u.id
+                WHERE m.user_id != %s
+                  AND m.room_id = %s
+                  AND m.organization_id = %s
+                  AND m.id > %s
+                ORDER BY m.id ASC
+                LIMIT 10
+            """, (user_id, room_id, organization_id, last_id))
+            msgs = await cursor.fetchall()
+            return msgs
+        
+async def get_users_in_room(pool, room_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT user_id
+                FROM room_participants 
+                WHERE room_id = %s
+            """, (room_id,))        
+            rows = await cursor.fetchall()
+            return [row['user_id'] for row in rows]  # return only the IDs
+
+async def get_user_names_in_room(pool, room_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT u.id, u.username
+                FROM room_participants rp
+                JOIN clients u ON rp.user_id = u.id
+                WHERE rp.room_id = %s
+            """, (room_id,))
+            users = await cursor.fetchall()
+            return users
+
+async def mark_msg_not_read(pool, user_ids, room_id):
+    placeholders = ','.join(['%s'] * len(user_ids))
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            sql = f"""
+                UPDATE room_participants 
+                SET last_message_seen = last_message_seen + 1
+                WHERE room_id = %s AND user_id IN ({placeholders})
+            """
+            await cursor.execute(sql, (room_id, *user_ids)) # TODO might be hard on the database if there are many people in room
+            await conn.commit()
+
+async def clear_user_last_seen_msg(pool, user_id, room_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            sql = f"""
+                UPDATE room_participants 
+                SET last_message_seen = 0
+                WHERE room_id = %s AND user_id = %s
+            """
+            await cursor.execute(sql, (room_id, user_id))
+            await conn.commit()
+        
+async def create_or_update_room(pool, user_id, room_name, user_ids, description, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT id FROM rooms WHERE name = %s", (room_name,))
+            await cursor.execute("SELECT id FROM rooms WHERE name = %s AND organization_id = %s", (room_name,organization_id))
             existing_room = await cursor.fetchone()
             if existing_room:
                 room_id = existing_room[0]
+                if await is_user_in_room(pool, user_id, room_id, organization_id) == False :
+                    return "User not in room to edit it"
                 # Update room info
                 if organization_id:
-                    await cursor.execute( "UPDATE rooms SET description = '%s', organization_id = %s WHERE id = %s", (description, organization_id, room_id))
+                    await cursor.execute( "UPDATE rooms SET description = %s, name = %s WHERE id = %s", (description, room_name, room_id))
                 # Remove old users
-                await cursor.execute("DELETE FROM room_users WHERE room_id = %s", (room_id,))
+                await cursor.execute("DELETE FROM room_participants WHERE room_id = %s", (room_id,))
             else:
                 # Insert new room
                 if organization_id:
-                    await cursor.execute( "INSERT INTO rooms (name, organization_id, description) VALUES (%s, %s, '%s')", (room_name, organization_id, description))
+                    await cursor.execute( "INSERT INTO rooms (name, organization_id, description) VALUES (%s, %s, %s)", (room_name, int(organization_id), description))
                 else:
                     await cursor.execute( "INSERT INTO rooms (name, description) VALUES (%s,%s)", (room_name,description))
                 room_id = cursor.lastrowid
 
             # Add users to the room
-            for user_id in user_ids:
-                await cursor.execute( "INSERT INTO room_users (room_id, user_id) VALUES (%s, %s)", (room_id, user_id))
+            await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, user_id, 0, int(organization_id)))
+            for uid in user_ids:
+                if uid.isdigit() == False :
+                    uid = await get_user_id(uid, organization_id)
+                if uid == user_id :
+                    continue
+                await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, uid, 0, int( organization_id )))
 
             await conn.commit()
             return room_id
 
+async def send_msg_to_users( message, user_ids ):
+    tasks = []
+    for ws, info in connected_clients.items():
+        user_id = info.get("user_id")
+        print(f"Checking connection {user_id}")
+        if user_id in user_ids :
+            tasks.append(ws.send(message))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+            
 # WebSocket server
-async def ws_handler(websocket, pool):
+async def ws_handler( websocket ):
+    global pool
 
-    cursor = db_conn.cursor(dictionary=True)
     connected_clients[websocket] = {"registered": False, "user": None}
     registered = False
+    
+    client_ip, client_port = websocket.remote_address
+    print(f"{client_ip}:{client_port}: New socket connection")
 
     try:
         async for message in websocket:
-            try: 
+            try:
                 theMessageContent = json.loads(message)
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"error": "Invalid JSON"}))
                 continue
 
-            client_info =connected_clients[websocket]
-            event = theMessageContent.get("event")
-
-            #resgiter client
-            if not client_info["registered"]:
+            try:
+                client_info =connected_clients[websocket]
                 event = theMessageContent.get("event")
-                if event=="register" :
-                    username = theMessageContent.get("username")
-                    user = check_user(pool, username)
-                    if user == None :
+                print(f"Request Event from {client_ip} '{event}'")
+
+                #resgiter client # Param are: user_id
+                if not client_info["registered"]:
+                    print(f"{client_ip}: Client not registered yet")
+                    event = theMessageContent.get("event")
+                    if event=="Register" :
+                        print(f"{client_ip}: Event '{event}'")
+                        user_id = theMessageContent.get("user_id")
+                        print(f"{client_ip}: user_id '{user_id}'")
+                        user = await check_user(user_id)
+                        if user == None :
+                            await websocket.send(json.dumps({
+                                "event":"register_error",
+                                "data":"invalid user"}))
+                            continue
+
+                        client_info["session_token"] = secrets.token_urlsafe(32)
+                        client_info["organization_id"] = user["organization_id"]
+                        client_info["registered"] = True
+                        client_info["user_id"] = user['id']
+                        client_info["username"] = user['username']
+
+                        await websocket.send( json.dumps({
+                            "event":"register_success",
+                            "data":client_info['session_token']}))
+                    else:
                         await websocket.send(json.dumps({
                             "event":"register_error",
-                            "data":"invalid user"}))
-                        continue;
+                            "data":"You must send a register event first"}))                
+                    continue
 
-                    client_info["register"] = True
-                    client_info["user_id"] = user["name"] 
-                    client_info["organization_id"] = user["organization_id"] 
-                    await websocket.send( json.dumps({
-                        "event":"register_success",
-                        "data":""}))
-                else:
-                    await websocket.send(json.dumps({
-                        "event":"register_error",
-                        "data":"You must send a register event first"}))
-                continue
+                ## get list of rooms  param: session_token
+                if event == "GetRooms":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
 
-            ## get list of rooms 
-            if event == "GetRooms":
-                rooms = await get_user_rooms(pool, client_info['user_id'])
-                if rooms == None :
-                    await websocket.send(json.dumps({
-                        "event":"GetRooms",
-                        "status":"failed",
-                        "data":"User not registered in any rooms"}))
-                else : 
-                    await websocket.send(json.dumps({
-                        "event": "GetRooms",
-                        "status":"success",
-                        "data": rooms }))
-                continue
+                    rooms = await get_user_rooms(pool, client_info['user_id'])
+                    if rooms == None :
+                        await websocket.send(json.dumps({
+                            "event":"get_rooms_failed",
+                            "data":"User not registered in any rooms"}))
+                    else : 
+                        print( rooms )
+                        await websocket.send(json.dumps({
+                            "event": "get_rooms",
+                            "data": rooms }))
+                    continue
 
-            ## create a rooms 
-            if event == "UpdateOrMakeRoom":
-                room_name = theMessageContent.get("name")
-                user_names = theMessageContent.get("users")
-                description = theMessageContent.get("description")
-                room_id = await create_or_update_room( pool, room_name, user_names, description, client_info['organization_id'] )
-                if room_id == None: 
-                    await websocket.send(json.dumps({
-                        "event":"UpdateOrMakeRoom",
-                        "status":"failed",
-                        "data":"Failed to create a room"}))
-                else:
-                    await websocket.send(json.dumps({
-                        "event":"UpdateOrMakeRoom",
-                        "status":"success"}))
+                ## create a rooms param: session_token, name, users, description
+                if event == "UpdateOrMakeRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
 
-            ## got the event and payload
-            if event == "Message":
-                room = theMessageContent.get("room")
-                broadcast_data = json.dumps({
-                    "event": "ChatMessageSent",
-                    "data": payload
-                })
-                await asyncio.gather(*[
-                    client.send(broadcast_data)
-                    for client in connected_clients
-                    if client != websocket
-                ])
+                    user_id = client_info['user_id']
+                    room_name = data["name"]
+                    user_names = data["users"]
+                    description = data["description"]
+                    room_id = await create_or_update_room( pool, user_id, room_name, user_names, description, client_info['organization_id'] )
+                    if room_id == None: 
+                        await websocket.send(json.dumps({
+                            "event":"update_or_make_room",
+                            "data":{ 
+                                "status": "failed",
+                                "msg":"Failed to create a room"
+                                }
+                            }))
+                    else:
+                        await websocket.send(json.dumps({
+                            "event":"update_or_make_room",
+                            "data":{ 
+                                "status": "success"
+                                }
+                            }))
+
+                ## get the users in a room -- param: session_token, room id
+                if event == "GetUsersInRoom" :
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    users = await get_user_names_in_room( pool, data['room'] )
+                    if users == None :
+                        await websocket.send(json.dumps({
+                            "event":"room_users",
+                            "data":""
+                        }))
+                    else :    
+                        print( users )
+                        await websocket.send(json.dumps({
+                            "event":"room_users",
+                            "data":users
+                        }))
+
+                ## Clear the last seen -- param: session_token, room id
+                if event == "ClearLastMessageSeen":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    room_id = data['room']
+                    user_id = client_info['user_id']
+                    await clear_user_last_seen_msg( pool, user_id, room_id )
+                    await websocket.send(json.dumps({
+                            "event":"cleared_last_seen_msgs",
+                            "data":""
+                        }))
+
+                ## Get all msgs in room after specific msg --- param: session_token, room id, last msg seen
+                if event == "GetMessagesInRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    room_id = data['room']
+                    last_id = data['last_id']
+                    user_id = client_info['user_id']
+                    organization_id = client_info['organization_id']
+
+                    msgs = await get_messages_in_room( pool, user_id, room_id, organization_id, last_id )
+                    await websocket.send(json.dumps({
+                            "event":"messages_in_room",
+                            "data": msgs
+                        }))
+                    
+                ## got the event and payload
+                if event == "BroadcastMessage":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    user_id = client_info['user_id']
+                    room_id = data['room']
+                    user_ids = await get_users_in_room( pool, room_id )
+                    print(f"{user_id}: Got BroadcastMessage ")
+
+                    if user_id in user_ids:
+                        user_ids.remove(client_info['user_id'])
+                    else:
+                        continue
+
+                    #store the msg for offline users
+                    id = await store_new_message(pool, user_id, data['message'], data['msginfo'], room_id, client_info['organization_id'])
+                    
+                    #broadcast it to online users
+                    broadcast_data = json.dumps({
+                        "event": "chat_message",
+                        "data": {
+                            "username": client_info['username'],
+                            'msgid': id,
+                            "room":room_id,
+                            "message": data['message'],
+                            "msginfo": data['msginfo'],
+                        }
+                    })
+                    await send_msg_to_users( broadcast_data, user_ids )
+
+                    #mark msg as not read to all users
+                    await mark_msg_not_read( pool, user_ids, room_id )
+
+            except Exception as outer_err:
+                # Catch websocket errors (disconnects, etc.)
+                print(f"WebSocket error: {outer_err}")
     except websockets.ConnectionClosed:
         pass
     finally:
@@ -175,22 +513,27 @@ async def http_sendmessage(request):
     return web.json_response({"status": "ok"})
 
 async def main():
+    global pool
+
+    await init_db()
     pool = await create_pool()
 
     # Start WebSocket server on port 8080
-    ws_server = await websockets.serve(lambda ws, path:ws_handler(ws, pool), "0.0.0.0", 8080)
+    #ws_server = await websockets.serve(lambda ws, path:ws_handler(ws, path, pool), SERVER_IP, 8080)
+    ws_server = await websockets.serve(ws_handler, SERVER_IP, 8080)
 
     # Start HTTP server on port 8081
-    app = web.Application()
-    app.add_routes([web.post('/sendmessage', http_sendmessage)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8081)
-    await site.start()
+    #app = web.Application()
+    #app.add_routes([web.post('/sendmessage', http_sendmessage)])
+    #runner = web.AppRunner(app)
+    #await runner.setup()
+    #site = web.TCPSite(runner, SERVER_IP, 8081)
+    #await site.start()
 
-    print("WebSocket: ws://0.0.0.0:8080")
-    print("HTTP POST: http://0.0.0.0:8081/sendmessage")
+    print(f"WebSocket: ws://{SERVER_IP}:8080")
+    #print("HTTP POST: http://{SERVER_IP}:8081/sendmessage")
     await asyncio.Future()  # run forever
+
 
 asyncio.run(main())
 
