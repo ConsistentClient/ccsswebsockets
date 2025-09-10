@@ -9,17 +9,12 @@ import aiomysql
 from functools import partial
 import secrets
 
+# config file local
+#import config
+from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME
+
 connected_clients = {}
 pool = None
-
-SERVER_IP = "127.0.0.1"
-
-DB_NAME = "ccsschatapp"
-DB_USER = "client1"
-DB_PASS = "pZL8giwz9vgvA3PuU4n"
-DB_HOST = "127.0.0.1"
-DB_PORT = 3306
-
 
 async def init_db():
     # Connect without specifying DB (to check/create DB)

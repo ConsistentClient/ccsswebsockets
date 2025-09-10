@@ -110,7 +110,7 @@
     let username = prompt("Enter your username:", "1234");
 
     function connect() {
-        ws = new WebSocket("ws://127.0.0.1:8080");
+        ws = new WebSocket("wss://graceful.consistentclientsupport.com/ws");
 
         ws.onopen = () => {
             console.log("Connected to server.");
