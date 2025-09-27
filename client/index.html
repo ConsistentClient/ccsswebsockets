@@ -108,16 +108,19 @@
     let session_token = null;
     let rooms = null;
     let username = prompt("Enter your username:", "1234");
+    let token = prompt("Enter token:", "1234");
 
     function connect() {
-        ws = new WebSocket("wss://graceful.consistentclientsupport.com/ws");
+        ws = new WebSocket("ws://localhost:8080");
+        //ws = new WebSocket("wss://graceful.consistentclientsupport.com/ws");
 
         ws.onopen = () => {
             console.log("Connected to server.");
             // Send registration with username
             ws.send(JSON.stringify({
                 event: "Register",
-                user_id: username
+                username: username,
+                token: token,
             }));
         };
 
@@ -145,6 +148,14 @@
                     addMessage(data.username, atob( data.message ), data.msginfo);
                 }
             }
+            else if (event == "last_messages_in_room" ) {
+                list_msgs = data;
+                list_msgs.forEach((msg) => {
+                    if (msg.room_id === currentRoomId) {
+                        addMessage(msg.username, atob( msg.message ));
+                    }
+                })
+            }
             else if (event == "messages_in_room") {
                 list_msgs = data;
                 list_msgs.forEach((msg) => {
@@ -171,7 +182,6 @@
         ws.onerror = (err) => console.error("WebSocket error:", err);
     }
 
-    // Send message with token for authentication
     function sendMessage() {
         if (!session_token) {
             alert("You must be registered first!");
@@ -196,7 +206,6 @@
         input.value = "";
     }
 
-    // Create a new room with token
     function GetListOfRooms() {
         if (!session_token) {
             alert("You must be registered first!");
@@ -281,11 +290,10 @@
         }));
 
         ws.send(JSON.stringify({
-            event: "GetMessagesInRoom",
+            event: "GetLastMessagesInRoom",
             data: {
                 "session_token": session_token,
                 "room": roomId,
-                "last_id": 0
             }
         }));
 

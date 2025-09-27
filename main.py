@@ -85,7 +85,6 @@ async def init_db():
             )
         """)
 
-
         await cursor.execute("""
             CREATE TABLE IF NOT EXISTS clients (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -125,11 +124,11 @@ async def get_user_id( username, organization_id ) :
             user = await cursor.fetchone()
             return user['id']  # None if not found, dict if found
         
-async def check_user(user_id):
+async def check_user(username, token):
     global pool
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("SELECT * FROM clients WHERE token = %s", (user_id,))
+            await cursor.execute("SELECT * FROM clients WHERE username = %s AND token = %s", (username, token,))
             user = await cursor.fetchone()
             return user  # None if not found, dict if found
 
@@ -166,6 +165,39 @@ async def store_new_message (pool, user_id, message, msginfo, room_id, organizat
             return msg_id
 
 
+async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                FROM room_messages m
+                JOIN clients u ON m.user_id = u.id
+                WHERE m.room_id = %s
+                  AND m.organization_id = %s
+                  AND m.is_deleted = 0
+                ORDER BY m.id DESC
+                LIMIT 20
+            """, (user_id, room_id, organization_id))
+            msgs = await cursor.fetchall()
+            return msgs
+        
+async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                FROM room_messages m
+                JOIN clients u ON m.user_id = u.id
+                WHERE m.room_id = %s
+                  AND m.organization_id = %s
+                  AND m.is_deleted = 0
+                  AND m.id < %s
+                ORDER BY m.id DESC
+                LIMIT 20
+            """, (user_id, room_id, organization_id, last_id))
+            msgs = await cursor.fetchall()
+            return msgs
+        
 async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -173,12 +205,12 @@ async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id)
                 SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
                 FROM room_messages m
                 JOIN clients u ON m.user_id = u.id
-                WHERE m.user_id != %s
-                  AND m.room_id = %s
+                WHERE m.room_id = %s
                   AND m.organization_id = %s
+                  AND m.is_deleted = 0
                   AND m.id > %s
                 ORDER BY m.id ASC
-                LIMIT 10
+                LIMIT 20
             """, (user_id, room_id, organization_id, last_id))
             msgs = await cursor.fetchall()
             return msgs
@@ -204,6 +236,8 @@ async def get_user_names_in_room(pool, room_id):
                 WHERE rp.room_id = %s
             """, (room_id,))
             users = await cursor.fetchall()
+            for user in users:
+                user["online"] = isUserOnline( user[0] )
             return users
 
 async def mark_msg_not_read(pool, user_ids, room_id):
@@ -263,6 +297,12 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
             await conn.commit()
             return room_id
 
+def isUserOnline( user_id ):
+    for ws, info in connected_clients.items():
+        if info.get("user_id") == user_id :
+            return True
+    return False
+
 async def send_msg_to_users( message, user_ids ):
     tasks = []
     for ws, info in connected_clients.items():
@@ -302,9 +342,10 @@ async def ws_handler( websocket ):
                     event = theMessageContent.get("event")
                     if event=="Register" :
                         print(f"{client_ip}: Event '{event}'")
-                        user_id = theMessageContent.get("user_id")
-                        print(f"{client_ip}: user_id '{user_id}'")
-                        user = await check_user(user_id)
+                        username = theMessageContent.get("username")
+                        token = theMessageContent.get("token")
+                        print(f"{client_ip}: user_id '{username}'")
+                        user = await check_user(username, token)
                         if user == None :
                             await websocket.send(json.dumps({
                                 "event":"register_error",
@@ -398,8 +439,7 @@ async def ws_handler( websocket ):
                             "event":"room_users",
                             "data":""
                         }))
-                    else :    
-                        print( users )
+                    else :
                         await websocket.send(json.dumps({
                             "event":"room_users",
                             "data":users
@@ -442,6 +482,47 @@ async def ws_handler( websocket ):
                     msgs = await get_messages_in_room( pool, user_id, room_id, organization_id, last_id )
                     await websocket.send(json.dumps({
                             "event":"messages_in_room",
+                            "data": msgs
+                        }))
+                    
+                ## Get all msgs in room before a specific msg --- param: session_token, room id, last msg seen
+                if event == "GetPrevMessagesInRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    room_id = data['room']
+                    last_id = data['last_id']
+                    user_id = client_info['user_id']
+                    organization_id = client_info['organization_id']
+
+                    msgs = await get_prev_messages_in_room( pool, user_id, room_id, organization_id, last_id )
+                    await websocket.send(json.dumps({
+                            "event":"prev_messages_in_room",
+                            "data": msgs
+                        }))
+                    
+                ## Get the last messages in a room --- param: session_token, room id, last msg seen
+                if event == "GetLastMessagesInRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    room_id = data['room']
+                    user_id = client_info['user_id']
+                    organization_id = client_info['organization_id']
+
+                    msgs = await get_last_messages_in_room( pool, user_id, room_id, organization_id )
+                    await websocket.send(json.dumps({
+                            "event":"last_messages_in_room",
                             "data": msgs
                         }))
                     
