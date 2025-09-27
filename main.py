@@ -181,6 +181,20 @@ async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
             msgs = await cursor.fetchall()
             return msgs
         
+async def delete_message_in_room(pool, user_id, room_id, msg_id, organization_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                UPDATE room_messages m
+                  SET is_deleted = 1
+                WHERE room_id = %s
+                  AND organization_id = %s
+                  AND user_id = %s
+                  AND id = %s
+            """, (room_id, organization_id, user_id, msg_id))
+            msgs = await cursor.fetchall()
+            return msgs
+        
 async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -521,6 +535,27 @@ async def ws_handler( websocket ):
                     organization_id = client_info['organization_id']
 
                     msgs = await get_last_messages_in_room( pool, user_id, room_id, organization_id )
+                    await websocket.send(json.dumps({
+                            "event":"last_messages_in_room",
+                            "data": msgs
+                        }))
+                    
+                ## delete msg in room --- param: session_token, room id, msg_id
+                if event == "DeleteMessageInRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    room_id = data['room']
+                    user_id = client_info['user_id']
+                    msg_id = data['msg_id']
+                    organization_id = client_info['organization_id']
+
+                    msgs = await delete_message_in_room( pool, user_id, room_id, msg_id, organization_id )
                     await websocket.send(json.dumps({
                             "event":"last_messages_in_room",
                             "data": msgs
