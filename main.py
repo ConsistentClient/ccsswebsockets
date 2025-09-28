@@ -11,7 +11,7 @@ import secrets
 
 # config file local
 #import config
-from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME
+from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SERVER_PORT
 
 connected_clients = {}
 pool = None
@@ -718,7 +718,7 @@ async def main():
 
     # Start WebSocket server on port 8080
     #ws_server = await websockets.serve(lambda ws, path:ws_handler(ws, path, pool), SERVER_IP, 8080)
-    ws_server = await websockets.serve(ws_handler, SERVER_IP, 8080)
+    ws_server = await websockets.serve(ws_handler, SERVER_IP, SERVER_PORT)
 
     # Start HTTP server on port 8081
     #app = web.Application()
@@ -728,7 +728,7 @@ async def main():
     #site = web.TCPSite(runner, SERVER_IP, 8081)
     #await site.start()
 
-    print(f"WebSocket: ws://{SERVER_IP}:8080")
+    print(f"WebSocket: ws://{SERVER_IP}:{SERVER_PORT}")
     #print("HTTP POST: http://{SERVER_IP}:8081/sendmessage")
     await asyncio.Future()  # run forever
 
