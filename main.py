@@ -160,11 +160,27 @@ async def get_user_rooms(pool, user_id):
 async def store_new_message (pool, user_id, message, msginfo, room_id, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute(" INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information, media_message) VALUES( %s, %s, %s, %s, %s, '')", (room_id, user_id, int( organization_id), message, msginfo))       
+            await cursor.execute("INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information, media_message) VALUES( %s, %s, %s, %s, %s, '')", (room_id, user_id, int( organization_id), message, msginfo))       
             msg_id = cursor.lastrowid
             return msg_id
 
+async def edit_message_in_room (pool, user_id, msg_id, message, msginfo, room_id, organization_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("UPDATE room_messages SET message = %s, message_information = %s WHERE msg_id=%s AND user_id=%s", ( message, msginfo, msg_id, user_id))
+            return cursor.rowcount
 
+async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organization_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                UPDATE room_participants 
+                SET last_message_seen = {msg_id} - 1
+                WHERE room_id = %s AND user_id IN ({placeholders})
+            """, (user_id, room_id, organization_id))
+            msgs = await cursor.fetchall()
+            return msgs
+        
 async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -254,13 +270,13 @@ async def get_user_names_in_room(pool, room_id):
                 user["online"] = isUserOnline( user[0] )
             return users
 
-async def mark_msg_not_read(pool, user_ids, room_id):
+async def mark_msg_not_read(pool, user_ids, room_id, msg_id):
     placeholders = ','.join(['%s'] * len(user_ids))
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             sql = f"""
                 UPDATE room_participants 
-                SET last_message_seen = last_message_seen + 1
+                SET last_message_seen = {msg_id} - 1
                 WHERE room_id = %s AND user_id IN ({placeholders})
             """
             await cursor.execute(sql, (room_id, *user_ids)) # TODO might be hard on the database if there are many people in room
@@ -561,6 +577,79 @@ async def ws_handler( websocket ):
                             "data": msgs
                         }))
                     
+                ## edit msg in room --- param: session_token, room id, msg_id
+                if event == "EditMessageInRoom":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    room_id = data['room']
+                    user_id = client_info['user_id']
+                    msg_id = data['msg_id']
+                    organization_id = client_info['organization_id']
+                    msg = data['message']
+                    info = data['msginfo']
+
+                    result = await edit_message_in_room( pool, user_id, room_id, msg_id, organization_id, msg, info )
+                    if(result > 0 ) :
+                        await websocket.send(json.dumps({
+                                "event":"edit_message_in_room",
+                                "data": result
+                            }))
+                        
+                        user_ids = await get_users_in_room( pool, room_id )
+
+                        #broadcast it to online users
+                        broadcast_data = json.dumps({
+                            "event": "chat_message_updated",
+                            "data": {
+                                "username": client_info['username'],
+                                'msgid': id,
+                                "room":room_id,
+                                "message": data['message'],
+                                "msginfo": data['msginfo'],
+                            }
+                        })
+                        await send_msg_to_users( broadcast_data, user_ids )
+
+                    else :
+                        await websocket.send(json.dumps({
+                                "event":"edit_message_in_room",
+                                "data": "failed"
+                            }))
+                    
+                ## got the event and payload
+                if event == "LastSeenMsg":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    room_id = data['room']
+                    user_id = client_info['user_id']
+                    msg_id = data['msg_id']
+                    organization_id = client_info['organization_id']
+                    result = await update_last_seen_msg_in_room( pool, user_id, room_id, msg_id, organization_id, msg, info )
+                    if(result > 0 ) :
+                        await websocket.send(json.dumps({
+                                "event":"update_last_seen_msg_in_room",
+                                "status": True
+                            }))
+                    else :
+                        await websocket.send(json.dumps({
+                                "event":"update_last_seen_msg_in_room",
+                                "status": False
+                            }))
+
                 ## got the event and payload
                 if event == "BroadcastMessage":
                     data = theMessageContent.get("data")
@@ -597,9 +686,6 @@ async def ws_handler( websocket ):
                         }
                     })
                     await send_msg_to_users( broadcast_data, user_ids )
-
-                    #mark msg as not read to all users
-                    await mark_msg_not_read( pool, user_ids, room_id )
 
             except Exception as outer_err:
                 # Catch websocket errors (disconnects, etc.)
