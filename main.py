@@ -52,6 +52,7 @@ async def init_db():
                 is_deleted tinyint(1) DEFAULT 0,
                 message_information LONGTEXT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_organization_id (organization_id),
                 INDEX idx_room_id (room_id),
                 INDEX idx_user_id (user_id)
@@ -67,6 +68,7 @@ async def init_db():
                 description TEXT DEFAULT NULL,
                 organization_id bigint(20) DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_organization_id (organization_id),
                 INDEX idx_status (status)
             )
@@ -80,6 +82,7 @@ async def init_db():
                 last_message_seen INT, 
                 organization_id INT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_user_id (user_id),
                 INDEX idx_organization_id (organization_id)
             )
@@ -92,6 +95,7 @@ async def init_db():
                 token VARCHAR(512) NOT NULL,
                 organization_id INT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_token (token),
                 INDEX idx_organization_id (organization_id)
             )
