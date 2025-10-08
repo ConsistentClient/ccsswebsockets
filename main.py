@@ -197,7 +197,7 @@ async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
                   AND m.is_deleted = 0
                 ORDER BY m.id DESC
                 LIMIT 20
-            """, (user_id, room_id, organization_id))
+            """, (room_id, organization_id))
             msgs = await cursor.fetchall()
             return msgs
         
@@ -228,8 +228,9 @@ async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, las
                   AND m.id < %s
                 ORDER BY m.id DESC
                 LIMIT 20
-            """, (user_id, room_id, organization_id, last_id))
+            """, (room_id, organization_id, last_id))
             msgs = await cursor.fetchall()
+            print(f"{msgs}")
             return msgs
         
 async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
@@ -245,7 +246,7 @@ async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id)
                   AND m.id > %s
                 ORDER BY m.id ASC
                 LIMIT 20
-            """, (user_id, room_id, organization_id, last_id))
+            """, (room_id, organization_id, last_id))
             msgs = await cursor.fetchall()
             return msgs
         
@@ -360,6 +361,7 @@ async def ws_handler( websocket ):
     try:
         async for message in websocket:
             try:
+                print(f"Got message {message}")
                 theMessageContent = json.loads(message)
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"error": "Invalid JSON"}))
@@ -533,7 +535,6 @@ async def ws_handler( websocket ):
                     last_id = data['last_id']
                     user_id = client_info['user_id']
                     organization_id = client_info['organization_id']
-
                     msgs = await get_prev_messages_in_room( pool, user_id, room_id, organization_id, last_id )
                     await websocket.send(json.dumps({
                             "event":"prev_messages_in_room",
