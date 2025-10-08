@@ -142,7 +142,10 @@ async def is_user_in_room(pool, user_id, room_id, organization_id):
             await cursor.execute("""
                 SELECT id
                 FROM room_participants
-                WHERE user_id = %s AND room_id = %s AND organization_id = %s
+                WHERE user_id = %s 
+                AND room_id = %s 
+                AND organization_id = %s
+                AND deleted_at IS NULL
             """, (user_id,room_id, organization_id))
             if await cursor.fetchone():
                 return True
@@ -157,6 +160,7 @@ async def get_user_rooms(pool, user_id):
                 FROM rooms r 
                 JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
+                AND ru.deleted_at IS NULL
             """, (user_id,))
             rooms = await cursor.fetchall()
             return rooms
@@ -180,7 +184,8 @@ async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organizat
             await cursor.execute("""
                 UPDATE room_participants 
                 SET last_message_seen = {msg_id} - 1
-                WHERE room_id = %s AND user_id IN ({placeholders})
+                WHERE room_id = %s 
+                AND user_id IN ({placeholders})
             """, (user_id, room_id, organization_id))
             msgs = await cursor.fetchall()
             return msgs
@@ -257,10 +262,25 @@ async def get_users_in_room(pool, room_id):
                 SELECT user_id
                 FROM room_participants 
                 WHERE room_id = %s
+                AND deleted_at IS NULL
             """, (room_id,))        
             rows = await cursor.fetchall()
             return [row['user_id'] for row in rows]  # return only the IDs
 
+async def leave_room ( pool, room_id, user_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                UPDATE room_participants rp
+                SET deleted_at = NOW() 
+                WHERE rp.room_id = %s
+                AND rp.user_id = %s
+            """, (room_id, user_id,))
+            if cursor.rowcount > 0:
+                return True
+            else :
+                return False
+        
 async def get_user_names_in_room(pool, room_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -269,6 +289,7 @@ async def get_user_names_in_room(pool, room_id):
                 FROM room_participants rp
                 JOIN clients u ON rp.user_id = u.id
                 WHERE rp.room_id = %s
+                AND rp.deleted_at IS NULL
             """, (room_id,))
             users = await cursor.fetchall()
             for user in users:
@@ -282,7 +303,8 @@ async def mark_msg_not_read(pool, user_ids, room_id, msg_id):
             sql = f"""
                 UPDATE room_participants 
                 SET last_message_seen = {msg_id} - 1
-                WHERE room_id = %s AND user_id IN ({placeholders})
+                WHERE room_id = %s 
+                AND user_id IN ({placeholders})
             """
             await cursor.execute(sql, (room_id, *user_ids)) # TODO might be hard on the database if there are many people in room
             await conn.commit()
@@ -294,6 +316,7 @@ async def clear_user_last_seen_msg(pool, user_id, room_id):
                 UPDATE room_participants 
                 SET last_message_seen = 0
                 WHERE room_id = %s AND user_id = %s
+                AND deleted_at IS NULL
             """
             await cursor.execute(sql, (room_id, user_id))
             await conn.commit()
@@ -481,6 +504,27 @@ async def ws_handler( websocket ):
                             "data":users
                         }))
 
+                ## leave room -- param: session_token, room id
+                if event == "LeaveRoom" :
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    
+                    res = await leave_room( pool, data['room'] )
+                    if( res == True ) :
+                        await websocket.send(json.dumps({
+                            "event":"leave_room_success",
+                        }))
+                    else : 
+                        await websocket.send(json.dumps({
+                            "event":"leave_room_failed",
+                        }))
+                    
                 ## Clear the last seen -- param: session_token, room id
                 if event == "ClearLastMessageSeen":
                     data = theMessageContent.get("data")
