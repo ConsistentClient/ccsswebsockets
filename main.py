@@ -218,6 +218,12 @@ async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
                 LIMIT 20
             """, (room_id, organization_id))
             msgs = await cursor.fetchall()
+
+            for msg in msgs:
+                for field in ("created_at", "updated_at"):
+                    if isinstance(msg.get(field), datetime):
+                        msg[field] = msg[field].isoformat()
+
             return msgs
         
 async def delete_message_in_room(pool, user_id, room_id, msg_id, organization_id) :
@@ -249,7 +255,10 @@ async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, las
                 LIMIT 20
             """, (room_id, organization_id, last_id))
             msgs = await cursor.fetchall()
-            print(f"{msgs}")
+            for msg in msgs:
+                for field in ("created_at", "updated_at"):
+                    if isinstance(msg.get(field), datetime):
+                        msg[field] = msg[field].isoformat()
             return msgs
         
 async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
@@ -267,6 +276,10 @@ async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id)
                 LIMIT 20
             """, (room_id, organization_id, last_id))
             msgs = await cursor.fetchall()
+            for msg in msgs:
+                for field in ("created_at", "updated_at"):
+                    if isinstance(msg.get(field), datetime):
+                        msg[field] = msg[field].isoformat()
             return msgs
         
 async def get_users_in_room(pool, room_id):
