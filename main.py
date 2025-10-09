@@ -756,7 +756,7 @@ async def ws_handler( websocket ):
     except websockets.ConnectionClosed:
         pass
     finally:
-        connected_clients.remove(websocket)
+        connected_clients.pop(websocket, None)
 
 # HTTP POST server
 async def http_sendmessage(request):
