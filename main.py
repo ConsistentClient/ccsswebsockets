@@ -208,7 +208,7 @@ async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information, m.created_at, m.updated_at
                 FROM room_messages m
                 JOIN clients u ON m.user_id = u.id
                 WHERE m.room_id = %s
@@ -238,7 +238,7 @@ async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, las
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information, m.created_at, m.updated_at
                 FROM room_messages m
                 JOIN clients u ON m.user_id = u.id
                 WHERE m.room_id = %s
@@ -256,7 +256,7 @@ async def get_messages_in_room(pool, user_id, room_id, organization_id, last_id)
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information
+                SELECT m.id, m.user_id, u.username, m.room_id, m.message, m.message_information, m.created_at, m.updated_at
                 FROM room_messages m
                 JOIN clients u ON m.user_id = u.id
                 WHERE m.room_id = %s
