@@ -101,6 +101,20 @@ async def init_db():
             )
         """)
 
+        await cursor.execute("""
+            SHOW COLUMNS FROM room_participants LIKE 'deleted_at'
+            """)
+        result = await cursor.fetchone()
+
+        if result:
+            print(f"✅ Column deleted_at already exists in room_participants.")
+        else:
+            print(f"⚙️ Adding column deleted_at to room_participants...")
+            await cursor.execute(f"""
+                ALTER TABLE room_participants
+                ADD COLUMN deleted_at TIMESTAMP NULL DEFAULT NULL
+                """)
+
         print("✅ Tables ensured.")
     await conn.commit()
     await conn.ensure_closed()
