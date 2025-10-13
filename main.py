@@ -504,7 +504,9 @@ async def ws_handler( websocket ):
                     else:
                         await websocket.send(json.dumps({
                             "event":"update_or_make_room",
-                            "data":{ 
+                            "data":{
+                                "room": room_id,
+                                "name": room_name,
                                 "status": "success"
                                 }
                             }))
