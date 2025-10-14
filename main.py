@@ -471,10 +471,10 @@ async def ws_handler( websocket ):
                             "event":"get_rooms_failed",
                             "data":"User not registered in any rooms"}))
                     else : 
-                        print( rooms )
                         await websocket.send(json.dumps({
                             "event": "get_rooms",
-                            "data": rooms }))
+                            "data": rooms 
+                            }))
                     continue
 
                 ## create a rooms param: session_token, name, users, description
@@ -746,13 +746,17 @@ async def ws_handler( websocket ):
                     print(f"{user_id}: Got BroadcastMessage ")
 
                     if user_id in user_ids:
-                        user_ids.remove(client_info['user_id'])
+                        user_ids.remove(user_id)
                     else:
+                        await websocket.send(json.dumps({
+                            "event":"broadcast_message_response",
+                            "status": False
+                        }))
                         continue
 
                     #store the msg for offline users
                     id = await store_new_message(pool, user_id, data['message'], data['msginfo'], room_id, client_info['organization_id'])
-                    
+
                     #broadcast it to online users
                     broadcast_data = json.dumps({
                         "event": "chat_message",
@@ -765,6 +769,12 @@ async def ws_handler( websocket ):
                         }
                     })
                     await send_msg_to_users( broadcast_data, user_ids )
+
+                    await websocket.send(json.dumps({
+                            "event":"broadcast_message_response",
+                            "status": True,
+                            "msgid": id
+                        }))
 
             except Exception as outer_err:
                 # Catch websocket errors (disconnects, etc.)
