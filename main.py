@@ -652,7 +652,7 @@ async def ws_handler( websocket ):
 
                     msgs = await delete_message_in_room( pool, user_id, room_id, msg_id, organization_id )
                     await websocket.send(json.dumps({
-                            "event":"last_messages_in_room",
+                            "event":"delete_messages_in_room",
                             "data": msgs
                         }))
                     
