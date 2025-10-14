@@ -702,6 +702,21 @@ async def ws_handler( websocket ):
                                 "data": "failed"
                             }))
                     
+                if event == "Ping":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    await websocket.send(json.dumps({
+                        "event":"ping_response",
+                        "status": True,
+                        "user_id": client_info['user_id']
+                        }))
+
                 ## got the event and payload
                 if event == "LastSeenMsg":
                     data = theMessageContent.get("data")
