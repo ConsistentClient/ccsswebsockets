@@ -544,7 +544,8 @@ async def ws_handler( websocket ):
                         }))
                         continue
 
-                    users = await get_user_names_in_room( pool, data['room'] )
+                    room_id = data['room']
+                    users = await get_user_names_in_room( pool, room_id )
                     if users == None :
                         await websocket.send(json.dumps({
                             "event":"room_users",
