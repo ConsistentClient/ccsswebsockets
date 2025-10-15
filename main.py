@@ -256,8 +256,12 @@ async def delete_message_in_room(pool, user_id, room_id, msg_id, organization_id
                   AND user_id = %s
                   AND id = %s
             """, (room_id, organization_id, user_id, msg_id))
-            msgs = await cursor.fetchall()
-            return msgs
+            await conn.commit()
+            if cursor.rowcount > 0:
+                return True
+            else:
+                return False
+
         
 async def get_prev_messages_in_room(pool, user_id, room_id, organization_id, last_id) :
     async with pool.acquire() as conn:
@@ -668,10 +672,10 @@ async def ws_handler( websocket ):
                     msg_id = data['msg_id']
                     organization_id = client_info['organization_id']
 
-                    msgs = await delete_message_in_room( pool, user_id, room_id, msg_id, organization_id )
+                    res = await delete_message_in_room( pool, user_id, room_id, msg_id, organization_id )
                     await websocket.send(json.dumps({
                             "event":"delete_messages_in_room",
-                            "data": msgs
+                            "success": res
                         }))
                     
                 ## edit msg in room --- param: session_token, room id, msg_id
