@@ -216,10 +216,10 @@ async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organizat
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
                 UPDATE room_participants 
-                SET last_message_seen = {msg_id} - 1
+                SET last_message_seen = %s
                 WHERE room_id = %s 
-                AND user_id IN ({placeholders})
-            """, (user_id, room_id, organization_id))
+                AND user_id = %s
+            """, (msg_id, room_id, user_id))
             msgs = await cursor.fetchall()
             return msgs
         
@@ -754,7 +754,7 @@ async def ws_handler( websocket ):
                     user_id = client_info['user_id']
                     msg_id = data['msg_id']
                     organization_id = client_info['organization_id']
-                    result = await update_last_seen_msg_in_room( pool, user_id, room_id, msg_id, organization_id, msg, info )
+                    result = await update_last_seen_msg_in_room( pool, user_id, room_id, msg_id, organization_id )
                     if(result > 0 ) :
                         await websocket.send(json.dumps({
                                 "event":"update_last_seen_msg_in_room",
