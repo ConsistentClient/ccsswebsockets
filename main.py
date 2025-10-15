@@ -220,8 +220,11 @@ async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organizat
                 WHERE room_id = %s 
                 AND user_id = %s
             """, (msg_id, room_id, user_id))
-            msgs = await cursor.fetchall()
-            return msgs
+            await conn.commit()
+            if cursor.rowcount > 0:
+                return True
+            else:
+                return False
         
 async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
     async with pool.acquire() as conn:
@@ -756,17 +759,11 @@ async def ws_handler( websocket ):
                     msg_id = data['msg_id']
                     organization_id = client_info['organization_id']
                     result = await update_last_seen_msg_in_room( pool, user_id, room_id, msg_id, organization_id )
-                    if(result > 0 ) :
-                        await websocket.send(json.dumps({
-                                "event":"update_last_seen_msg_in_room",
-                                "status": True
-                            }))
-                    else :
-                        await websocket.send(json.dumps({
-                                "event":"update_last_seen_msg_in_room",
-                                "status": False
-                            }))
-
+                    await websocket.send(json.dumps({
+                        "event":"update_last_seen_msg_in_room",
+                        "status": result
+                    }))
+                    
                 ## got the event and payload
                 if event == "BroadcastMessage":
                     data = theMessageContent.get("data")
