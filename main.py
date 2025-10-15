@@ -131,7 +131,7 @@ async def init_db():
             print(f"⚙️ Adding column device_token to clients...")
             await cursor.execute(f"""
                 ALTER TABLE clients
-                ADD COLUMN device_token VARCHAR(255) DEFAULT NULL
+                ADD COLUMN device_token TEXT DEFAULT NULL
                 """)
 
         print("✅ Tables ensured.")
