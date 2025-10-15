@@ -9,6 +9,9 @@ import aiomysql
 from functools import partial
 import secrets
 from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, messaging
+
 
 # config file local
 #import config
@@ -107,6 +110,7 @@ async def init_db():
             """)
         result = await cursor.fetchone()
 
+        
         if result:
             print(f"✅ Column deleted_at already exists in room_participants.")
         else:
@@ -114,6 +118,19 @@ async def init_db():
             await cursor.execute(f"""
                 ALTER TABLE room_participants
                 ADD COLUMN deleted_at TIMESTAMP NULL DEFAULT NULL
+                """)
+
+        await cursor.execute("""
+            SHOW COLUMNS FROM clients LIKE 'device_token'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column device_token already exists in clients.")
+        else:
+            print(f"⚙️ Adding column device_token to clients...")
+            await cursor.execute(f"""
+                ALTER TABLE clients
+                ADD COLUMN device_token VARCHAR(255) NOT NULL,
                 """)
 
         print("✅ Tables ensured.")
@@ -799,6 +816,29 @@ async def ws_handler( websocket ):
     finally:
         connected_clients.pop(websocket, None)
 
+def send_push_notification(token, title, body, data=None):
+    """
+    Sends a push notification to a specific device via FCM.
+    :param token: The FCM device registration token.
+    :param title: Notification title.
+    :param body: Notification body.
+    :param data: Optional custom key/value payload (dict).
+    """
+    # Create the message
+    message = messaging.Message(
+        notification=messaging.Notification(
+            title=title,
+            body=body,
+        ),
+        token=token,
+        data=data or {}
+    )
+
+    # Send message
+    response = messaging.send(message)
+    print(f"✅ Successfully sent message: {response}")
+
+
 # HTTP POST server
 async def http_sendmessage(request):
     data = await request.post()
@@ -816,6 +856,9 @@ async def http_sendmessage(request):
 
 async def main():
     global pool
+
+    cred = credentials.Certificate("firebase_credentials.json")
+    firebase_admin.initialize_app(cred)
 
     await init_db()
     pool = await create_pool()
