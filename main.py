@@ -109,8 +109,6 @@ async def init_db():
             SHOW COLUMNS FROM room_participants LIKE 'deleted_at'
             """)
         result = await cursor.fetchone()
-
-        
         if result:
             print(f"✅ Column deleted_at already exists in room_participants.")
         else:
@@ -124,7 +122,6 @@ async def init_db():
             SHOW COLUMNS FROM clients LIKE 'device_token'
             """)
         result = await cursor.fetchone()
-
         if result:
             print(f"✅ Column device_token already exists in clients.")
         else:
@@ -132,6 +129,19 @@ async def init_db():
             await cursor.execute(f"""
                 ALTER TABLE clients
                 ADD COLUMN device_token TEXT DEFAULT NULL
+                """)
+            
+        await cursor.execute("""
+            SHOW COLUMNS FROM rooms LIKE 'owner_id'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column owner_id already exists in rooms.")
+        else:
+            print(f"⚙️ Adding column owner_id to rooms...")
+            await cursor.execute(f"""
+                ALTER TABLE rooms
+                ADD COLUMN owner_id bigint(20) DEFAULT 0
                 """)
 
         print("✅ Tables ensured.")
@@ -391,9 +401,9 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
             else:
                 # Insert new room
                 if organization_id:
-                    await cursor.execute( "INSERT INTO rooms (name, organization_id, description) VALUES (%s, %s, %s)", (room_name, int(organization_id), description))
+                    await cursor.execute( "INSERT INTO rooms (name, organization_id, description, owner_id) VALUES (%s, %s, %s, %s)", (room_name, int(organization_id), description, user_id))
                 else:
-                    await cursor.execute( "INSERT INTO rooms (name, description) VALUES (%s,%s)", (room_name,description))
+                    await cursor.execute( "INSERT INTO rooms (name, description, owner_id) VALUES (%s,%s)", (room_name,description, user_id))
                 room_id = cursor.lastrowid
 
             # Add users to the room
