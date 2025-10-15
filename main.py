@@ -124,13 +124,14 @@ async def init_db():
             SHOW COLUMNS FROM clients LIKE 'device_token'
             """)
         result = await cursor.fetchone()
+
         if result:
             print(f"✅ Column device_token already exists in clients.")
         else:
             print(f"⚙️ Adding column device_token to clients...")
             await cursor.execute(f"""
                 ALTER TABLE clients
-                ADD COLUMN device_token VARCHAR(255) DEFAULT NULL,,
+                ADD COLUMN device_token VARCHAR(255) DEFAULT NULL
                 """)
 
         print("✅ Tables ensured.")
