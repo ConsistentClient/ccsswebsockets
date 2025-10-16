@@ -351,7 +351,7 @@ async def get_room_owner(pool, room_id):
                 SELECT u.id, u.username
                 FROM rooms rp
                 JOIN clients u ON rp.owner_id = u.id
-                WHERE rp.room_id = %s
+                WHERE rp.id = %s
             """, (room_id,))
             users = await cursor.fetchall()
             for user in users:
