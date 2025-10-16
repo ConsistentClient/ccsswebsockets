@@ -199,7 +199,7 @@ async def get_user_rooms(pool, user_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT r.id, r.name, r.description, ru.last_message_seen
+                SELECT r.id, r.name, r.description, ru.last_message_seen, r.owner_id
                 FROM rooms r 
                 JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
@@ -343,6 +343,20 @@ async def leave_room ( pool, room_id, user_id) :
                 return True
             else :
                 return False
+
+async def get_room_owner(pool, room_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT u.id, u.username
+                FROM room rp
+                JOIN clients u ON rp.owner_id = u.id
+                WHERE rp.room_id = %s
+            """, (room_id,))
+            users = await cursor.fetchall()
+            for user in users:
+                user["online"] = isUserOnline( user[0] )
+            return users
         
 async def get_user_names_in_room(pool, room_id):
     async with pool.acquire() as conn:
@@ -558,17 +572,13 @@ async def ws_handler( websocket ):
                         continue
 
                     room_id = data['room']
+                    owners = await get_room_owner(pool, room_id)
                     users = await get_user_names_in_room( pool, room_id )
-                    if users == None :
-                        await websocket.send(json.dumps({
-                            "event":"room_users",
-                            "data":""
-                        }))
-                    else :
-                        await websocket.send(json.dumps({
-                            "event":"room_users",
-                            "data":users
-                        }))
+                    await websocket.send(json.dumps({
+                        "event":"room_users",
+                        "users":users,
+                        "owners":owners
+                    }))
 
                 ## leave room -- param: session_token, room id
                 if event == "LeaveRoom" :
