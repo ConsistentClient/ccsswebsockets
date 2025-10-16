@@ -349,13 +349,14 @@ async def get_room_owner(pool, room_id):
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
                 SELECT u.id, u.username
-                FROM rooms rp
-                JOIN clients u ON rp.owner_id = u.id
-                WHERE rp.id = %s
+                FROM rooms r
+                JOIN clients u ON r.owner_id = u.id
+                WHERE r.id = %s
             """, (room_id,))
             users = await cursor.fetchall()
             for user in users:
-                user["online"] = isUserOnline( user[0] )
+                uid = user['id']
+                user["online"] = isUserOnline( uid )
             return users
 
 async def get_user_names_in_room(pool, room_id):
@@ -370,7 +371,8 @@ async def get_user_names_in_room(pool, room_id):
             """, (room_id,))
             users = await cursor.fetchall()
             for user in users:
-                user["online"] = isUserOnline( user[0] )
+                uid = user['id']
+                user["online"] = isUserOnline( uid )
             return users
 
 async def mark_msg_not_read(pool, user_ids, room_id, msg_id):
