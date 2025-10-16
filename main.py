@@ -349,7 +349,7 @@ async def get_room_owner(pool, room_id):
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
                 SELECT u.id, u.username
-                FROM room rp
+                FROM rooms rp
                 JOIN clients u ON rp.owner_id = u.id
                 WHERE rp.room_id = %s
             """, (room_id,))
@@ -357,7 +357,7 @@ async def get_room_owner(pool, room_id):
             for user in users:
                 user["online"] = isUserOnline( user[0] )
             return users
-        
+
 async def get_user_names_in_room(pool, room_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -576,8 +576,8 @@ async def ws_handler( websocket ):
                     users = await get_user_names_in_room( pool, room_id )
                     await websocket.send(json.dumps({
                         "event":"room_users",
-                        "users":users,
-                        "owners":owners
+                        "users":users or [],
+                        "owners":owners or []
                     }))
 
                 ## leave room -- param: session_token, room id
