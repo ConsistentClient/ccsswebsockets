@@ -765,6 +765,21 @@ async def ws_handler( websocket ):
                         "user_id": client_info['user_id']
                         }))
 
+                if event == "GetUserStatus":
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    user_id = data['user_id']
+                    await websocket.send(json.dumps({
+                        "event":"user_status_response",
+                        "status": isUserOnline(user_id),
+                        }))
+                    
                 ## got the event and payload
                 if event == "LastSeenMsg":
                     data = theMessageContent.get("data")
