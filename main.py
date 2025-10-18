@@ -179,17 +179,17 @@ async def check_user(username, token):
             user = await cursor.fetchone()
             return user  # None if not found, dict if found
 
-async def is_user_in_room(pool, user_id, room_id, organization_id):
+async def is_user_room_owner(pool, user_id, room_id, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
                 SELECT id
-                FROM room_participants
-                WHERE user_id = %s 
-                AND room_id = %s 
+                FROM rooms
+                WHERE id = %s 
+                AND owner_id = %s 
                 AND organization_id = %s
                 AND deleted_at IS NULL
-            """, (user_id,room_id, organization_id))
+            """, (room_id, user_id, organization_id))
             if await cursor.fetchone():
                 return True
             else :
@@ -407,8 +407,8 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
             existing_room = await cursor.fetchone()
             if existing_room:
                 room_id = existing_room[0]
-                if await is_user_in_room(pool, user_id, room_id, organization_id) == False :
-                    return "User not in room to edit it"
+                if await is_user_room_owner(pool, user_id, room_id, organization_id) == False :
+                    return False
                 # Update room info
                 if organization_id:
                     await cursor.execute( "UPDATE rooms SET description = %s, name = %s WHERE id = %s", (description, room_name, room_id))
@@ -423,14 +423,17 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
                 room_id = cursor.lastrowid
 
             # Add users to the room
-            await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, user_id, 0, int(organization_id)))
+            found = False
             for uid in user_ids:
                 if uid.isdigit() == False :
                     uid = await get_user_id(uid, organization_id)
                 if uid == user_id :
-                    continue
+                    found = True
                 await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, uid, 0, int( organization_id )))
 
+            if( found == False ):
+                await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, user_id, 0, int(organization_id)))
+                
             await conn.commit()
             return room_id
 
@@ -543,7 +546,8 @@ async def ws_handler( websocket ):
                     room_name = data["name"]
                     user_names = data["users"]
                     description = data["description"]
-                    room_id = await create_or_update_room( pool, user_id, room_name, user_names, description, client_info['organization_id'] )
+                    org_id = client_info['organization_id']
+                    room_id = await create_or_update_room( pool, user_id, room_name, user_names, description, org_id )
                     if room_id == None: 
                         await websocket.send(json.dumps({
                             "event":"update_or_make_room",
