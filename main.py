@@ -176,7 +176,7 @@ async def create_pool():
     )
     return pool
 
-def _can_send_message(last_sent_time: datetime | None, cooldown_minutes: int = 5) -> bool:
+def _can_send_message(last_sent_time: datetime | None, cooldown_minutes: int = 5) :
     if last_sent_time is None:
         return True  # no previous message
     now = datetime.utcnow()
