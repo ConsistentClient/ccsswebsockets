@@ -176,7 +176,7 @@ async def create_pool():
     )
     return pool
 
-def _can_send_message(last_sent_time: datetime | None, cooldown_minutes: int = 5) :
+def _can_send_message(last_sent_time , cooldown_minutes ) :
     if last_sent_time is None:
         return True  # no previous message
     now = datetime.utcnow()
@@ -189,7 +189,7 @@ async def can_send_message( pool, user_id, organization_id ) :
             await cursor.execute("SELECT created_at FROM client_notifications WHERE user_id = %s AND organization_id = %s", (user_id, int(organization_id)))
             result = await cursor.fetchone()
             last_sent = result['created_at'] if result else None
-            return _can_send_message(last_sent)
+            return _can_send_message(last_sent, 5)
 
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body ) :
     async with pool.acquire() as conn:
