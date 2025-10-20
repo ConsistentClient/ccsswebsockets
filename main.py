@@ -490,7 +490,7 @@ async def send_msg_to_users( pool, message, user_ids, organization_id ):
                 tasks.append(ws.send(message))
                 break
         if found == False:
-            if can_send_message(user_id):
+            if can_send_message(pool, user_id, organization_id ):
                 send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you" )
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
