@@ -192,10 +192,9 @@ async def can_send_message( pool, user_id, organization_id ) :
             return _can_send_message(last_sent, 5)
 
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, room_id ) :
-    datas = {
-        "room": room_id
+    data = {
+        "room": f"{room_id}"
     }
-    data = json.dumps( datas )
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", (user_id, int(organization_id)))
