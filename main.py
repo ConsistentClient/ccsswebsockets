@@ -194,7 +194,7 @@ async def can_send_message( pool, user_id, organization_id ) :
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body ) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("SELECT device_token FROM clients WHERE user_id = %s AND organization_id = %s", (user_id, int(organization_id)))
+            await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", (user_id, int(organization_id)))
             result = await cursor.fetchone()
             device_tokens = json.load (result['device_token']) if result else None
             for tok in device_tokens:
