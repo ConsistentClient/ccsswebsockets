@@ -8,7 +8,7 @@ import mysql.connector
 import aiomysql
 from functools import partial
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, messaging
 
@@ -45,6 +45,21 @@ async def init_db():
     )
     async with conn.cursor() as cursor:
         # Create tables if not exist
+        await cursor.execute("""
+            CREATE TABLE IF NOT EXISTS client_notifications (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                organization_id bigint(20) NOT NULL,
+                user_id bigint(20) unsigned NOT NULL,
+                msg_type INT,
+                message TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_organization_id (organization_id),
+                INDEX idx_msg_type (msg_type),
+                INDEX idx_user_id (user_id)
+            )
+        """)
+
         await cursor.execute("""
             CREATE TABLE IF NOT EXISTS room_messages (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -148,7 +163,6 @@ async def init_db():
     await conn.commit()
     await conn.ensure_closed()
 
-
 async def create_pool():
     pool = await aiomysql.create_pool(
         host=DB_HOST,
@@ -162,15 +176,38 @@ async def create_pool():
     )
     return pool
 
+def _can_send_message(last_sent_time: datetime | None, cooldown_minutes: int = 5) -> bool:
+    if last_sent_time is None:
+        return True  # no previous message
+    now = datetime.utcnow()
+    elapsed = now - last_sent_time
+    return elapsed > timedelta(minutes=cooldown_minutes)
+
+async def can_send_message( pool, user_id, organization_id ) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT created_at FROM client_notifications WHERE user_id = %s AND organization_id = %s", (user_id, int(organization_id)))
+            result = await cursor.fetchone()
+            last_sent = result['created_at'] if result else None
+            return _can_send_message(last_sent)
+
+async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body ) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT device_token FROM clients WHERE user_id = %s AND organization_id = %s", (user_id, int(organization_id)))
+            result = await cursor.fetchone()
+            device_tokens = json.load (result['device_token']) if result else None
+            for tok in device_tokens:
+                send_push_notification( tok.token, msg_title, msg_body )
+
 async def get_user_id( username, organization_id ) :
     global pool
-    print(f"In get_user_id {username}")
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT id FROM clients WHERE username = %s AND organization_id = %s", (username, int(organization_id)))
             user = await cursor.fetchone()
             return user['id']  # None if not found, dict if found
-        
+
 async def check_user(username, token):
     global pool
     async with pool.acquire() as conn:
@@ -188,7 +225,6 @@ async def is_user_room_owner(pool, user_id, room_id, organization_id):
                 WHERE id = %s 
                 AND owner_id = %s 
                 AND organization_id = %s
-                AND deleted_at IS NULL
             """, (room_id, user_id, organization_id))
             if await cursor.fetchone():
                 return True
@@ -235,7 +271,7 @@ async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organizat
                 return True
             else:
                 return False
-        
+
 async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -399,7 +435,7 @@ async def clear_user_last_seen_msg(pool, user_id, room_id):
             """
             await cursor.execute(sql, (room_id, user_id))
             await conn.commit()
-        
+
 async def create_or_update_room(pool, user_id, room_name, user_ids, description, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
@@ -433,7 +469,7 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
 
             if( found == False ):
                 await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, user_id, 0, int(organization_id)))
-                
+
             await conn.commit()
             return room_id
 
@@ -443,16 +479,22 @@ def isUserOnline( user_id ):
             return True
     return False
 
-async def send_msg_to_users( message, user_ids ):
+async def send_msg_to_users( pool, message, user_ids, organization_id ):
     tasks = []
-    for ws, info in connected_clients.items():
-        user_id = info.get("user_id")
-        print(f"Checking connection {user_id}")
-        if user_id in user_ids :
-            tasks.append(ws.send(message))
+    for user_id in user_ids.items():
+        found = False
+        for ws, info in connected_clients.items():
+            ws_user_id = info.get("user_id")
+            if(user_id == ws_user_id) :
+                found = True
+                tasks.append(ws.send(message))
+                break
+        if found == False:
+            if can_send_message(user_id):
+                send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you" )
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-            
+
 # WebSocket server
 async def ws_handler( websocket ):
     global pool
@@ -552,6 +594,7 @@ async def ws_handler( websocket ):
                         await websocket.send(json.dumps({
                             "event":"update_or_make_room",
                             "data":{ 
+                                "room": room_id,
                                 "status": "failed",
                                 "msg":"Failed to create a room"
                                 }
@@ -582,6 +625,7 @@ async def ws_handler( websocket ):
                     users = await get_user_names_in_room( pool, room_id )
                     await websocket.send(json.dumps({
                         "event":"room_users",
+                        "room":room_id,
                         "users":users or [],
                         "owners":owners or []
                     }))
@@ -746,7 +790,7 @@ async def ws_handler( websocket ):
                                 "msginfo": data['msginfo'],
                             }
                         })
-                        await send_msg_to_users( broadcast_data, user_ids )
+                        await send_msg_to_users( pool, broadcast_data, user_ids, organization_id )
 
                     else :
                         await websocket.send(json.dumps({
@@ -817,6 +861,7 @@ async def ws_handler( websocket ):
                         continue
 
                     user_id = client_info['user_id']
+                    organization_id = client_info['organization_id']
                     room_id = data['room']
                     user_ids = await get_users_in_room( pool, room_id )
                     print(f"{user_id}: Got BroadcastMessage ")
@@ -844,7 +889,7 @@ async def ws_handler( websocket ):
                             "msginfo": data['msginfo'],
                         }
                     })
-                    await send_msg_to_users( broadcast_data, user_ids )
+                    await send_msg_to_users( pool, broadcast_data, user_ids, organization_id )
 
                     await websocket.send(json.dumps({
                             "event":"broadcast_message_response",
