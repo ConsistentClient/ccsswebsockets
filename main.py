@@ -198,6 +198,7 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             result = await cursor.fetchone()
             device_tokens = json.load (result['device_token']) if result else None
             for tok in device_tokens:
+                print(f"send_notifcation_message: Sending notification message to {user_id} {tok.token}")
                 send_push_notification( tok.token, msg_title, msg_body )
 
 async def get_user_id( username, organization_id ) :
