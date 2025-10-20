@@ -191,7 +191,10 @@ async def can_send_message( pool, user_id, organization_id ) :
             last_sent = result['created_at'] if result else None
             return _can_send_message(last_sent, 5)
 
-async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body ) :
+async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, room_id ) :
+    data = {
+        "room": room_id
+    }
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", (user_id, int(organization_id)))
@@ -202,7 +205,7 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             device_tokens = json.loads( json_device_tokens )
             for tok in device_tokens:
                 print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
-                send_push_notification( tok['token'], msg_title, msg_body )
+                send_push_notification( tok['token'], msg_title, msg_body, data )
 
 async def get_user_id( username, organization_id ) :
     global pool
@@ -483,7 +486,7 @@ def isUserOnline( user_id ):
             return True
     return False
 
-async def send_msg_to_users( pool, message, user_ids, organization_id ):
+async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
     tasks = []
     for user_id in user_ids:
         found = False
@@ -495,7 +498,7 @@ async def send_msg_to_users( pool, message, user_ids, organization_id ):
                 break
         if found == False:
             if await can_send_message(pool, user_id, organization_id ):
-                await send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you" )
+                await send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you", room_id )
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -794,7 +797,7 @@ async def ws_handler( websocket ):
                                 "msginfo": data['msginfo'],
                             }
                         })
-                        await send_msg_to_users( pool, broadcast_data, user_ids, organization_id )
+                        await send_msg_to_users( pool, broadcast_data, user_ids, organization_id, room_id )
 
                     else :
                         await websocket.send(json.dumps({
@@ -893,7 +896,7 @@ async def ws_handler( websocket ):
                             "msginfo": data['msginfo'],
                         }
                     })
-                    await send_msg_to_users( pool, broadcast_data, user_ids, organization_id )
+                    await send_msg_to_users( pool, broadcast_data, user_ids, organization_id, room_id )
 
                     await websocket.send(json.dumps({
                             "event":"broadcast_message_response",
