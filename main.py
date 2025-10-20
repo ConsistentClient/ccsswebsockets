@@ -481,7 +481,7 @@ def isUserOnline( user_id ):
 
 async def send_msg_to_users( pool, message, user_ids, organization_id ):
     tasks = []
-    for user_id in user_ids.items():
+    for user_id in user_ids:
         found = False
         for ws, info in connected_clients.items():
             ws_user_id = info.get("user_id")
