@@ -737,7 +737,8 @@ async def ws_handler( websocket ):
                         await websocket.send(json.dumps({
                             "event":"silent_room_failed",
                         }))
-                    
+
+                ###
                 if event == "UnSilentRoom" :
                     data = theMessageContent.get("data")
                     session_token = data['session_token']
