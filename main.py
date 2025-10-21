@@ -429,6 +429,20 @@ async def silent_room ( pool, room_id, user_id) :
                 return True
             else :
                 return False
+            
+async def unsilent_room ( pool, room_id, user_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                UPDATE room_participants
+                SET silent_notifications = 0
+                WHERE room_id = %s
+                AND user_id = %s
+            """, (room_id, user_id,))
+            if cursor.rowcount > 0:
+                return True
+            else :
+                return False
 
 async def get_room_owner(pool, room_id):
     async with pool.acquire() as conn:
@@ -722,6 +736,27 @@ async def ws_handler( websocket ):
                     else : 
                         await websocket.send(json.dumps({
                             "event":"silent_room_failed",
+                        }))
+                    
+                if event == "UnSilentRoom" :
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    
+                    user_id = client_info['user_id']
+                    res = await unsilent_room( pool, user_id, data['room'] )
+                    if( res == True ) :
+                        await websocket.send(json.dumps({
+                            "event":"unsilent_room_success",
+                        }))
+                    else : 
+                        await websocket.send(json.dumps({
+                            "event":"unsilent_room_failed",
                         }))
                     
                 ## Clear the last seen -- param: session_token, room id
