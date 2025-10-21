@@ -691,6 +691,7 @@ async def ws_handler( websocket ):
                         }))
                         continue
                     
+                    user_id = client_info['user_id']
                     res = await leave_room( pool, data['room'], user_id )
                     if( res == True ) :
                         await websocket.send(json.dumps({
@@ -712,6 +713,7 @@ async def ws_handler( websocket ):
                         }))
                         continue
                     
+                    user_id = client_info['user_id']
                     res = await silent_room( pool, user_id, data['room'] )
                     if( res == True ) :
                         await websocket.send(json.dumps({
