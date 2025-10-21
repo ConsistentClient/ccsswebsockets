@@ -931,7 +931,7 @@ async def ws_handler( websocket ):
                             "data":"Session token is invalid"
                         }))
                         continue
-                    user_id = data['user_id']
+                    user_id = client_info['user_id']
                     await websocket.send(json.dumps({
                         "event":"user_status_response",
                         "user_id": user_id,
