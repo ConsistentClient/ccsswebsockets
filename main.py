@@ -103,7 +103,8 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_user_id (user_id),
-                INDEX idx_organization_id (organization_id)
+                INDEX idx_organization_id (organization_id),
+                INDEX idx_room_id (room_id)
             )
         """)
 
@@ -131,6 +132,19 @@ async def init_db():
             await cursor.execute(f"""
                 ALTER TABLE room_participants
                 ADD COLUMN deleted_at TIMESTAMP NULL DEFAULT NULL
+                """)
+            
+        await cursor.execute("""
+            SHOW COLUMNS FROM room_participants LIKE 'silent_notifications'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column silent_notifications already exists in room_participants.")
+        else:
+            print(f"⚙️ Adding column silent_notifications to room_participants...")
+            await cursor.execute(f"""
+                ALTER TABLE room_participants
+                ADD COLUMN silent_notifications INT NOT NULL DEFAULT 0
                 """)
 
         await cursor.execute("""
@@ -183,14 +197,26 @@ def _can_send_message(last_sent_time , cooldown_minutes ) :
     elapsed = now - last_sent_time
     return elapsed > timedelta(minutes=cooldown_minutes)
 
-async def can_send_message( pool, user_id, organization_id ) :
+async def can_send_message( pool, user_id, organization_id, room_id ) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("SELECT created_at FROM client_notifications WHERE user_id = %s AND organization_id = %s", (user_id, int(organization_id)))
+            await cursor.execute("SELECT silent_notifications FROM room_participants WHERE user_id = %s AND organization_id = %s AND room_id = %s AND deleted_at IS NULL ORDER BY id DESC LIMIT 1", (user_id, int(organization_id), room_id))
+            result = await cursor.fetchone()
+            silent = result['silent_notifications'] if result else None
+            if silent == 1 : 
+                return False
+            await cursor.execute("SELECT created_at FROM client_notifications WHERE user_id = %s AND organization_id = %s ORDER BY id DESC LIMIT 1", (user_id, int(organization_id)))
             result = await cursor.fetchone()
             last_sent = result['created_at'] if result else None
             return _can_send_message(last_sent, 5)
-
+        
+async def store_send_notification_message (pool, user_id, message, msg_type, organization_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("INSERT INTO client_notifications (user_id, organization_id, message, msg_type) VALUES( %s, %s, %s, %s)", (user_id, int( organization_id), message, msg_type))
+            msg_id = cursor.lastrowid
+            return msg_id
+        
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, room_id ) :
     data = {
         "room": f"{room_id}"
@@ -202,11 +228,14 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             json_device_tokens = result['device_token'] if result else None
             if( json_device_tokens == None ) :
                 return
+    
             device_tokens = json.loads( json_device_tokens )
             for tok in device_tokens:
                 print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
                 send_push_notification( tok['token'], msg_title, msg_body, data )
-
+    
+            store_send_notification_message( pool, user_id, msg_title, 1, organization_id)    
+                
 async def get_user_id( username, organization_id ) :
     global pool
     async with pool.acquire() as conn:
@@ -242,7 +271,7 @@ async def get_user_rooms(pool, user_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT r.id, r.name, r.description, ru.last_message_seen, r.owner_id
+                SELECT r.id, r.name, r.description, ru.last_message_seen, r.owner_id, ru.silent_notifications
                 FROM rooms r 
                 JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
@@ -377,10 +406,24 @@ async def leave_room ( pool, room_id, user_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                UPDATE room_participants rp
+                UPDATE room_participants 
                 SET deleted_at = NOW() 
-                WHERE rp.room_id = %s
-                AND rp.user_id = %s
+                WHERE room_id = %s
+                AND user_id = %s
+            """, (room_id, user_id,))
+            if cursor.rowcount > 0:
+                return True
+            else :
+                return False
+
+async def silent_room ( pool, room_id, user_id) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                UPDATE room_participants
+                SET silent_notifications = 1 
+                WHERE room_id = %s
+                AND user_id = %s
             """, (room_id, user_id,))
             if cursor.rowcount > 0:
                 return True
@@ -497,7 +540,7 @@ async def send_msg_to_users( pool, message, user_ids, organization_id, room_id )
                 tasks.append(ws.send(message))
                 break
         if found == False:
-            if await can_send_message(pool, user_id, organization_id ):
+            if await can_send_message(pool, user_id, organization_id, room_id ):
                 await send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you", room_id )
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -648,7 +691,7 @@ async def ws_handler( websocket ):
                         }))
                         continue
                     
-                    res = await leave_room( pool, data['room'] )
+                    res = await leave_room( pool, data['room'], user_id )
                     if( res == True ) :
                         await websocket.send(json.dumps({
                             "event":"leave_room_success",
@@ -656,6 +699,27 @@ async def ws_handler( websocket ):
                     else : 
                         await websocket.send(json.dumps({
                             "event":"leave_room_failed",
+                        }))
+
+                ###
+                if event == "SilentRoom" :
+                    data = theMessageContent.get("data")
+                    session_token = data['session_token']
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+                    
+                    res = await silent_room( pool, user_id, data['room'] )
+                    if( res == True ) :
+                        await websocket.send(json.dumps({
+                            "event":"silent_room_success",
+                        }))
+                    else : 
+                        await websocket.send(json.dumps({
+                            "event":"silent_room_failed",
                         }))
                     
                 ## Clear the last seen -- param: session_token, room id
@@ -832,6 +896,7 @@ async def ws_handler( websocket ):
                     user_id = data['user_id']
                     await websocket.send(json.dumps({
                         "event":"user_status_response",
+                        "user_id": user_id,
                         "status": isUserOnline(user_id),
                         }))
                     
