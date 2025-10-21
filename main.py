@@ -234,7 +234,7 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
                 print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
                 send_push_notification( tok['token'], msg_title, msg_body, data )
     
-            store_send_notification_message( pool, user_id, msg_title, 1, organization_id)    
+            await store_send_notification_message( pool, user_id, msg_title, 1, organization_id)    
                 
 async def get_user_id( username, organization_id ) :
     global pool
