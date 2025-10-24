@@ -508,7 +508,7 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
             if existing_room:
                 room_id = existing_room[0]
                 if await is_user_room_owner(pool, user_id, room_id, organization_id) == False :
-                    return False
+                    return None
                 # Update room info
                 if organization_id:
                     await cursor.execute( "UPDATE rooms SET description = %s, name = %s WHERE id = %s", (description, room_name, room_id))
