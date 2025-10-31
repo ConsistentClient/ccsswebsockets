@@ -11,7 +11,7 @@ import secrets
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, messaging
-
+from firebase_admin import exceptions  
 
 # config file local
 #import config
@@ -1056,8 +1056,26 @@ async def http_sendmessage(request):
 async def main():
     global pool
 
-    cred = credentials.Certificate("firebase_credentials.json")
-    firebase_admin.initialize_app(cred)
+    try:
+        cred = credentials.Certificate("firebase_credentials.json")
+        firebase_admin.initialize_app(cred)
+        print("Firebase initialized successfully")
+
+    except ValueError as e:
+        # Happens if Firebase app is already initialized
+        print("Firebase already initialized:", e)
+
+    except FileNotFoundError as e:
+        # Happens if the service account file path is wrong
+        print("Credential file not found:", e)
+
+    except exceptions.FirebaseError as e:
+        # Catches Firebase-specific errors (e.g., invalid credentials)
+        print("Firebase initialization error:", e)
+
+    except Exception as e:
+        # Generic catch-all for anything unexpected
+        print("Unexpected error:", e)
 
     await init_db()
     pool = await create_pool()
