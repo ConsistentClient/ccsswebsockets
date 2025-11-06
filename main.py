@@ -172,6 +172,20 @@ async def init_db():
                 ALTER TABLE rooms
                 ADD COLUMN owner_id bigint(20) DEFAULT 0
                 """)
+            
+
+        await cursor.execute("""
+            SHOW COLUMNS FROM clients LIKE 'active'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column active already exists in clients.")
+        else:
+            print(f"⚙️ Adding column active to clients...")
+            await cursor.execute(f"""
+                ALTER TABLE clients
+                ADD COLUMN clients INT DEFAULT 30
+                """)
 
         print("✅ Tables ensured.")
     await conn.commit()
