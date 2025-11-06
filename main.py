@@ -184,7 +184,7 @@ async def init_db():
             print(f"⚙️ Adding column active to clients...")
             await cursor.execute(f"""
                 ALTER TABLE clients
-                ADD COLUMN clients INT DEFAULT 30
+                ADD COLUMN active INT DEFAULT 30
                 """)
 
         print("✅ Tables ensured.")
