@@ -67,7 +67,6 @@ async def init_db():
                 room_id INT NOT NULL,
                 user_id bigint(20) unsigned NOT NULL,
                 message TEXT NOT NULL,
-                media_message TEXT NOT NULL,
                 is_deleted tinyint(1) DEFAULT 0,
                 message_information LONGTEXT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -297,7 +296,7 @@ async def get_user_rooms(pool, user_id):
 async def store_new_message (pool, user_id, message, msginfo, room_id, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information, media_message) VALUES( %s, %s, %s, %s, %s, '')", (room_id, user_id, int( organization_id), message, msginfo))       
+            await cursor.execute("INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information) VALUES( %s, %s, %s, %s, %s)", (room_id, user_id, int( organization_id), message, msginfo))       
             msg_id = cursor.lastrowid
             return msg_id
 
