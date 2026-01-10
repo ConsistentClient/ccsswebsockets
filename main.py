@@ -171,7 +171,6 @@ async def init_db():
                 ALTER TABLE rooms
                 ADD COLUMN owner_id bigint(20) DEFAULT 0
                 """)
-            
 
         await cursor.execute("""
             SHOW COLUMNS FROM clients LIKE 'active'
@@ -210,6 +209,14 @@ def _can_send_message(last_sent_time , cooldown_minutes ) :
     elapsed = now - last_sent_time
     return elapsed > timedelta(minutes=cooldown_minutes)
 
+async def get_user_id_using_username( pool, username, organization_id ) :
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT id FROM clients WHERE username = %s AND organization_id = %s LIMIT 1", (username, int(organization_id)))
+            result = await cursor.fetchone()
+            user_id = result['id'] if result else None
+            return user_id
+
 async def can_send_message( pool, user_id, organization_id, room_id ) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -222,17 +229,41 @@ async def can_send_message( pool, user_id, organization_id, room_id ) :
             result = await cursor.fetchone()
             last_sent = result['created_at'] if result else None
             return _can_send_message(last_sent, 5)
-        
+
 async def store_send_notification_message (pool, user_id, message, msg_type, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("INSERT INTO client_notifications (user_id, organization_id, message, msg_type) VALUES( %s, %s, %s, %s)", (user_id, int( organization_id), message, msg_type))
             msg_id = cursor.lastrowid
             return msg_id
-        
+
+async def send_general_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, message_data ) :
+    data = {
+        "type": "notification",
+        "data": f"{message_data}"
+    }
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", 
+                        (user_id, int(organization_id)))
+            result = await cursor.fetchone()
+            json_device_tokens = result['device_token'] if result else None
+            if( json_device_tokens == None ) :
+                return
+            try:
+                device_tokens = json.loads(json_device_tokens)
+            except json.JSONDecodeError:
+                print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
+                return
+            for tok in device_tokens:
+                print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
+                send_push_notification( tok['token'], msg_title, msg_body, data )
+            await store_send_notification_message( pool, user_id, msg_title, 2, organization_id)    
+
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, room_id ) :
     data = {
-        "room": f"{room_id}"
+        "type": "chat_msg",
+        "data": f"{room_id}"
     }
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -242,7 +273,11 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             if( json_device_tokens == None ) :
                 return
     
-            device_tokens = json.loads( json_device_tokens )
+            try:
+                device_tokens = json.loads(json_device_tokens)
+            except json.JSONDecodeError:
+                print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
+                return
             for tok in device_tokens:
                 print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
                 send_push_notification( tok['token'], msg_title, msg_body, data )
@@ -255,7 +290,7 @@ async def get_user_id( username, organization_id ) :
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT id FROM clients WHERE username = %s AND organization_id = %s", (username, int(organization_id)))
             user = await cursor.fetchone()
-            return user['id']  # None if not found, dict if found
+            return user['id'] if user else None  # None if not found, dict if found
 
 async def check_user(username, token):
     global pool
@@ -303,7 +338,7 @@ async def store_new_message (pool, user_id, message, msginfo, room_id, organizat
 async def edit_message_in_room (pool, user_id, msg_id, message, msginfo, room_id, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            await cursor.execute("UPDATE room_messages SET message = %s, message_information = %s WHERE msg_id=%s AND user_id=%s", ( message, msginfo, msg_id, user_id))
+            await cursor.execute("UPDATE room_messages SET message = %s, message_information = %s WHERE id=%s AND user_id=%s AND room_id=%s AND organization_id=%s", ( message, msginfo, msg_id, user_id, room_id, organization_id))
             return cursor.rowcount
 
 async def update_last_seen_msg_in_room(pool, user_id, room_id, msg_id, organization_id) :
@@ -342,7 +377,7 @@ async def get_last_messages_in_room(pool, user_id, room_id, organization_id) :
                         msg[field] = msg[field].isoformat()
 
             return msgs
-        
+
 async def delete_message_in_room(pool, user_id, room_id, msg_id, organization_id) :
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -489,6 +524,8 @@ async def get_user_names_in_room(pool, room_id):
             return users
 
 async def mark_msg_not_read(pool, user_ids, room_id, msg_id):
+    if not user_ids:
+        return
     placeholders = ','.join(['%s'] * len(user_ids))
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
@@ -538,8 +575,10 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
             # Add users to the room
             found = False
             for uid in user_ids:
-                if uid.isdigit() == False :
+                if not isinstance(uid, str) or uid.isdigit() == False :
                     uid = await get_user_id(uid, organization_id)
+                if uid is None:
+                    continue
                 if uid == user_id :
                     found = True
                 await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, uid, 0, int( organization_id )))
@@ -555,6 +594,20 @@ def isUserOnline( user_id ):
         if info.get("user_id") == user_id :
             return True
     return False
+
+async def send_general_notification_msg_to_users( pool, message, user_id, organization_id, msg_title, msg_body ):
+    tasks = []
+    found = False
+    for ws, info in connected_clients.items():
+        ws_user_id = info.get("user_id")
+        if(user_id == ws_user_id) :
+            found = True
+            tasks.append(ws.send(message))
+            break
+    if found == False:
+        await send_general_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, message ) # send using firebase
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
     tasks = []
@@ -626,6 +679,60 @@ async def ws_handler( websocket ):
                             "event":"register_error",
                             "data":"You must send a register event first"}))                
                     continue
+
+                ## send notifications to clients
+                if event == "notification":
+                    data = theMessageContent.get("data") or {}
+                    session_token = data.get('session_token')
+                    if client_info['session_token'] != session_token :
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is invalid"
+                        }))
+                        continue
+
+                    organization_id = theMessageContent.get("organization_id")
+                    if organization_id is None:
+                        await websocket.send(json.dumps({
+                            "error":"invalid organization id",
+                            "data":"organization id is missing"
+                        }))
+                        continue
+
+                    org_id = client_info['organization_id']
+                    if int(org_id) != int(organization_id) :
+                        await websocket.send(json.dumps({
+                            "error":"invalid organization id",
+                            "data":"invalid organization id"
+                        }))
+                        continue
+
+                    username = theMessageContent.get("username")
+                    user_id = await get_user_id_using_username(pool, username, organization_id)
+                    if user_id != None:
+                        msg_title = theMessageContent.get("title")
+                        msg_body = theMessageContent.get("body")
+                        if isinstance(data, dict) and "notification" in data:
+                            payload = data["notification"]
+                        else:
+                            payload = data if isinstance(data, str) else json.dumps(data)
+                        
+                        notification_message = json.dumps({
+                            "event": "notification",
+                            "data": {
+                                "title": msg_title,
+                                "body": msg_body,
+                                "message": data['notification'],
+                            }
+                        })
+                        await send_general_notification_msg_to_users(pool, notification_message, user_id, organization_id, msg_title, msg_body)
+                        await websocket.send( json.dumps({
+                            "event":"notification_success",
+                            }))
+                    else :
+                        await websocket.send( json.dumps({
+                            "event":"notification_failed",
+                            "data":"username is not found"}))
 
                 ## get list of rooms  param: session_token
                 if event == "GetRooms":
@@ -741,7 +848,7 @@ async def ws_handler( websocket ):
                         continue
                     
                     user_id = client_info['user_id']
-                    res = await silent_room( pool, user_id, data['room'] )
+                    res = await silent_room( pool, data['room'], user_id )
                     if( res == True ) :
                         await websocket.send(json.dumps({
                             "event":"silent_room_success",
@@ -763,7 +870,7 @@ async def ws_handler( websocket ):
                         continue
                     
                     user_id = client_info['user_id']
-                    res = await unsilent_room( pool, user_id, data['room'] )
+                    res = await unsilent_room( pool, data['room'], user_id )
                     if( res == True ) :
                         await websocket.send(json.dumps({
                             "event":"unsilent_room_success",
@@ -892,7 +999,7 @@ async def ws_handler( websocket ):
                     msg = data['message']
                     info = data['msginfo']
 
-                    result = await edit_message_in_room( pool, user_id, room_id, msg_id, organization_id, msg, info )
+                    result = await edit_message_in_room( pool, user_id, msg_id, msg, info, room_id, organization_id )
                     if(result > 0 ) :
                         await websocket.send(json.dumps({
                                 "event":"edit_message_in_room",
@@ -906,7 +1013,7 @@ async def ws_handler( websocket ):
                             "event": "chat_message_updated",
                             "data": {
                                 "username": client_info['username'],
-                                'msgid': id,
+                                'msgid': msg_id,
                                 "room":room_id,
                                 "message": data['message'],
                                 "msginfo": data['msginfo'],
@@ -1111,6 +1218,4 @@ async def main():
 
 
 asyncio.run(main())
-
-
 
