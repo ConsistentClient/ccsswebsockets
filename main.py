@@ -242,7 +242,7 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
         "type": "notification",
         "data": f"{message_data}"
     }
-    print(f"    -->>   In function send_general_notifcation_message")
+    print(f"    -->>   In function send_general_notifcation_message {user_id}")
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", 
@@ -280,7 +280,7 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
                 print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
                 return
             for tok in device_tokens:
-                print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
+                print(f"send_notifcation_message: Sending notification message to {user_id} ")
                 send_push_notification( tok['token'], msg_title, msg_body, data )
     
             await store_send_notification_message( pool, user_id, msg_title, 1, organization_id)    
@@ -599,7 +599,7 @@ def isUserOnline( user_id ):
 async def send_general_notification_msg_to_users( pool, message, user_id, organization_id, msg_title, msg_body ):
     tasks = []
     found = False
-    print(f"   -->>    In function send_general_notification_msg_to_users ")
+    print(f"   -->>    In function send_general_notification_msg_to_users {user_id} ")
     for ws, info in connected_clients.items():
         ws_user_id = info.get("user_id")
         if(user_id == ws_user_id) :
