@@ -242,6 +242,7 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
         "type": "notification",
         "data": f"{message_data}"
     }
+    print(f"    -->>   In function send_general_notifcation_message")
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", 
@@ -253,10 +254,10 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
             try:
                 device_tokens = json.loads(json_device_tokens)
             except json.JSONDecodeError:
-                print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
+                print(f"    -->>   send_notifcation_message: Invalid device_token JSON for user {user_id}")
                 return
             for tok in device_tokens:
-                print(f"send_notifcation_message: Sending notification message to {user_id} {tok['token']}")
+                print(f"    -->>   send_notifcation_message: Sending notification message to {user_id}")
                 send_push_notification( tok['token'], msg_title, msg_body, data )
             await store_send_notification_message( pool, user_id, msg_title, 2, organization_id)    
 
@@ -598,15 +599,19 @@ def isUserOnline( user_id ):
 async def send_general_notification_msg_to_users( pool, message, user_id, organization_id, msg_title, msg_body ):
     tasks = []
     found = False
+    print(f"   -->>    In function send_general_notification_msg_to_users ")
     for ws, info in connected_clients.items():
         ws_user_id = info.get("user_id")
         if(user_id == ws_user_id) :
             found = True
             tasks.append(ws.send(message))
             break
+
     if found == False:
-        await send_general_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, message ) # send using firebase
+        print(f"    -->>   sending to {user_id} is offline using firebase")
+        await send_general_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, message ) 
     if tasks:
+        print(f"   -->>    sending to {user_id} is online - using websockets")
         await asyncio.gather(*tasks, return_exceptions=True)
 
 async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
@@ -693,6 +698,7 @@ async def ws_handler( websocket ):
                     data = theMessageContent.get("data") or {}
                     session_token = data.get('session_token')
                     if client_info['session_token'] != session_token :
+                        print(f"{client_ip}: invalid token Session token is invalid")
                         await websocket.send(json.dumps({
                             "error":"invalid token",
                             "data":"Session token is invalid"
@@ -701,6 +707,7 @@ async def ws_handler( websocket ):
 
                     organization_id = theMessageContent.get("organization_id")
                     if organization_id is None:
+                        print(f"{client_ip}: invalid organization id")
                         await websocket.send(json.dumps({
                             "error":"invalid organization id",
                             "data":"organization id is missing"
@@ -708,7 +715,8 @@ async def ws_handler( websocket ):
                         continue
 
                     org_id = client_info['organization_id']
-                    if int(org_id) != int(organization_id) :
+                    if int(org_id) > 0 and int(org_id) != int(organization_id) :
+                        print(f"{client_ip}: invalid organization id does not match client organization id")
                         await websocket.send(json.dumps({
                             "error":"invalid organization id",
                             "data":"invalid organization id"
@@ -738,6 +746,7 @@ async def ws_handler( websocket ):
                             "event":"notification_success",
                             }))
                     else :
+                        print(f"{client_ip}: username is not found")
                         await websocket.send( json.dumps({
                             "event":"notification_failed",
                             "data":"username is not found"}))
