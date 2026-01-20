@@ -638,11 +638,16 @@ async def ws_handler( websocket ):
     registered = False
     
     # Prefer proxy-provided client IPs when behind nginx.
-    forwarded_for = websocket.request_headers.get("X-Forwarded-For")
+    headers = None
+    if hasattr(websocket, "request_headers"):
+        headers = websocket.request_headers
+    elif hasattr(websocket, "request") and websocket.request is not None:
+        headers = websocket.request.headers
+    forwarded_for = headers.get("X-Forwarded-For") if headers else None
     if forwarded_for:
         client_ip = forwarded_for.split(",")[0].strip()
     else:
-        client_ip = websocket.request_headers.get("X-Real-IP")
+        client_ip = headers.get("X-Real-IP") if headers else None
     client_ip = client_ip or websocket.remote_address[0]
     client_port = websocket.remote_address[1]
     print(f"{client_ip}:{client_port}: New socket connection")
