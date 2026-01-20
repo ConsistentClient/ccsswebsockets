@@ -632,7 +632,14 @@ async def ws_handler( websocket ):
     connected_clients[websocket] = {"registered": False, "user": None}
     registered = False
     
-    client_ip, client_port = websocket.remote_address
+    # Prefer proxy-provided client IPs when behind nginx.
+    forwarded_for = websocket.request_headers.get("X-Forwarded-For")
+    if forwarded_for:
+        client_ip = forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = websocket.request_headers.get("X-Real-IP")
+    client_ip = client_ip or websocket.remote_address[0]
+    client_port = websocket.remote_address[1]
     print(f"{client_ip}:{client_port}: New socket connection")
 
     try:
@@ -651,7 +658,6 @@ async def ws_handler( websocket ):
 
                 #resgiter client # Param are: user_id
                 if not client_info["registered"]:
-                    print(f"{client_ip}: Client not registered yet")
                     event = theMessageContent.get("event")
                     if event=="Register" :
                         print(f"{client_ip}: Event '{event}'")
@@ -675,6 +681,8 @@ async def ws_handler( websocket ):
                             "event":"register_success",
                             "data":client_info['session_token']}))
                     else:
+                        print(f"{client_ip}: Event '{event}'")
+                        print(f"{client_ip}: Client not registered yet")
                         await websocket.send(json.dumps({
                             "event":"register_error",
                             "data":"You must send a register event first"}))                
@@ -1218,4 +1226,3 @@ async def main():
 
 
 asyncio.run(main())
-
