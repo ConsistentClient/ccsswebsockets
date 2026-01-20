@@ -1050,8 +1050,14 @@ async def ws_handler( websocket ):
                             }))
                     
                 if event == "Ping":
-                    data = theMessageContent.get("data")
-                    session_token = data['session_token']
+                    data = theMessageContent.get("data") or {}
+                    session_token = data.get('session_token')
+                    if not session_token:
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is missing"
+                        }))
+                        continue
                     if client_info['session_token'] != session_token :
                         await websocket.send(json.dumps({
                             "error":"invalid token",
@@ -1065,8 +1071,14 @@ async def ws_handler( websocket ):
                         }))
 
                 if event == "GetUserStatus":
-                    data = theMessageContent.get("data")
-                    session_token = data['session_token']
+                    data = theMessageContent.get("data") or {}
+                    session_token = data.get('session_token')
+                    if not session_token:
+                        await websocket.send(json.dumps({
+                            "error":"invalid token",
+                            "data":"Session token is missing"
+                        }))
+                        continue
                     if client_info['session_token'] != session_token :
                         await websocket.send(json.dumps({
                             "error":"invalid token",
