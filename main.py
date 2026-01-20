@@ -1177,7 +1177,7 @@ def send_push_notification(token, title, body, data=None):
 
     # Send message
     response = messaging.send(message)
-    print(f"✅ Successfully sent message: {response}")
+    print(f"✅ Successfully sent message with token: {token} response:  {response}")
 
 
 # HTTP POST server
