@@ -256,9 +256,22 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
             except json.JSONDecodeError:
                 print(f"    -->>   send_notifcation_message: Invalid device_token JSON for user {user_id}")
                 return
+            if not isinstance(device_tokens, list):
+                print(f"    -->>   send_notifcation_message: Invalid device_token payload for user {user_id}")
+                return
+            invalid_tokens = []
             for tok in device_tokens:
                 print(f"    -->>   send_notifcation_message: Sending notification message to {user_id}")
-                send_push_notification( tok['token'], msg_title, msg_body, data )
+                status = send_push_notification( tok.get('token'), msg_title, msg_body, data )
+                if status == "unregistered":
+                    invalid_tokens.append(tok.get('token'))
+            if invalid_tokens:
+                device_tokens = [t for t in device_tokens if t.get("token") not in invalid_tokens]
+                new_value = json.dumps(device_tokens) if device_tokens else None
+                await cursor.execute(
+                    "UPDATE clients SET device_token = %s WHERE id = %s AND organization_id = %s",
+                    (new_value, user_id, int(organization_id)),
+                )
             await store_send_notification_message( pool, user_id, msg_title, 2, organization_id)    
 
 async def send_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, room_id ) :
@@ -279,9 +292,22 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             except json.JSONDecodeError:
                 print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
                 return
+            if not isinstance(device_tokens, list):
+                print(f"send_notifcation_message: Invalid device_token payload for user {user_id}")
+                return
+            invalid_tokens = []
             for tok in device_tokens:
                 print(f"send_notifcation_message: Sending notification message to {user_id} ")
-                send_push_notification( tok['token'], msg_title, msg_body, data )
+                status = send_push_notification( tok.get('token'), msg_title, msg_body, data )
+                if status == "unregistered":
+                    invalid_tokens.append(tok.get('token'))
+            if invalid_tokens:
+                device_tokens = [t for t in device_tokens if t.get("token") not in invalid_tokens]
+                new_value = json.dumps(device_tokens) if device_tokens else None
+                await cursor.execute(
+                    "UPDATE clients SET device_token = %s WHERE id = %s AND organization_id = %s",
+                    (new_value, user_id, int(organization_id)),
+                )
     
             await store_send_notification_message( pool, user_id, msg_title, 1, organization_id)    
                 
@@ -1188,8 +1214,19 @@ def send_push_notification(token, title, body, data=None):
     )
 
     # Send message
-    response = messaging.send(message)
-    print(f"✅ Successfully sent message with token: {token} response:  {response}")
+    try:
+        response = messaging.send(message)
+        print(f"✅ Successfully sent message with token: {token} response:  {response}")
+        return "ok"
+    except messaging.UnregisteredError as e:
+        print(f"FCM token unregistered: {token} error: {e}")
+        return "unregistered"
+    except exceptions.FirebaseError as e:
+        print(f"FCM send error for token {token}: {e}")
+        return "error"
+    except Exception as e:
+        print(f"Unexpected FCM error for token {token}: {e}")
+        return "error"
 
 
 # HTTP POST server
