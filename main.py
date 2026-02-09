@@ -14,13 +14,16 @@ from firebase_admin import credentials, messaging
 from firebase_admin import exceptions  
 
 # config file local
-#import config
-from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SERVER_PORT
+import config
+from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SERVER_PORT, NOTIFY_USER, NOTIFY_USER_PATH
 
 connected_clients = {}
 pool = None
 
 async def init_db():
+    notify_user = NOTIFY_USER
+    notify_user_path = NOTIFY_USER_PATH
+
     # Connect without specifying DB (to check/create DB)
     conn = await aiomysql.connect(
         host=DB_HOST, port=DB_PORT,
@@ -184,6 +187,31 @@ async def init_db():
                 ALTER TABLE clients
                 ADD COLUMN active INT DEFAULT 30
                 """)
+
+        if notify_user and notify_user_path:
+            await cursor.execute(
+                """
+                SELECT id
+                FROM clients
+                WHERE username = %s AND token = %s AND organization_id = 0
+                LIMIT 1
+                """,
+                (notify_user, notify_user_path),
+            )
+            result = await cursor.fetchone()
+            if result:
+                print("✅ Notify user already exists in clients.")
+            else:
+                print("⚙️ Adding notify user to clients...")
+                await cursor.execute(
+                    """
+                    INSERT INTO clients (username, token, organization_id)
+                    VALUES (%s, %s, 0)
+                    """,
+                    (notify_user, notify_user_path),
+                )
+        else:
+            print("ℹ️ NOTIFY_USER or NOTIFY_USER_PATH missing in config; skipping notify user bootstrap.")
 
         print("✅ Tables ensured.")
     await conn.commit()
