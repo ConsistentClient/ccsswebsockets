@@ -88,6 +88,7 @@ async def init_db():
                 image VARCHAR(255) DEFAULT NULL,
                 description TEXT DEFAULT NULL,
                 organization_id bigint(20) DEFAULT 0,
+                last_message_at TIMESTAMP NULL DEFAULT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 INDEX idx_organization_id (organization_id),
@@ -173,6 +174,19 @@ async def init_db():
             await cursor.execute(f"""
                 ALTER TABLE rooms
                 ADD COLUMN owner_id bigint(20) DEFAULT 0
+                """)
+
+        await cursor.execute("""
+            SHOW COLUMNS FROM rooms LIKE 'last_message_at'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column last_message_at already exists in rooms.")
+        else:
+            print(f"⚙️ Adding column last_message_at to rooms...")
+            await cursor.execute(f"""
+                ALTER TABLE rooms
+                ADD COLUMN last_message_at TIMESTAMP NULL DEFAULT NULL
                 """)
 
         await cursor.execute("""
@@ -374,11 +388,12 @@ async def get_user_rooms(pool, user_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT r.id, r.name, r.description, ru.last_message_seen, r.owner_id, ru.silent_notifications
+                SELECT r.id, r.name, r.description, r.last_message_at, ru.last_message_seen, r.owner_id, ru.silent_notifications
                 FROM rooms r 
                 JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
                 AND ru.deleted_at IS NULL
+                ORDER BY r.last_message_at DESC, r.id DESC
             """, (user_id,))
             rooms = await cursor.fetchall()
             return rooms
@@ -387,6 +402,7 @@ async def store_new_message (pool, user_id, message, msginfo, room_id, organizat
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information) VALUES( %s, %s, %s, %s, %s)", (room_id, user_id, int( organization_id), message, msginfo))       
+            await cursor.execute("UPDATE rooms SET last_message_at = NOW() WHERE id = %s", (room_id,))
             msg_id = cursor.lastrowid
             return msg_id
 
