@@ -396,6 +396,10 @@ async def get_user_rooms(pool, user_id):
                 ORDER BY r.last_message_at DESC, r.id DESC
             """, (user_id,))
             rooms = await cursor.fetchall()
+            for room in rooms:
+                for field, value in room.items():
+                    if isinstance(value, datetime):
+                        room[field] = value.isoformat()
             return rooms
 
 async def store_new_message (pool, user_id, message, msginfo, room_id, organization_id):
