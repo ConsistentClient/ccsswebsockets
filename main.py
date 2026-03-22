@@ -84,6 +84,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS rooms (
                 id INT AUTO_INCREMENT PRIMARY KEY,
                 name VARCHAR(255) DEFAULT NULL,
+                room_type VARCHAR(16) NOT NULL DEFAULT 'group',
                 status INT DEFAULT 0,
                 image VARCHAR(255) DEFAULT NULL,
                 description TEXT DEFAULT NULL,
@@ -187,6 +188,19 @@ async def init_db():
             await cursor.execute(f"""
                 ALTER TABLE rooms
                 ADD COLUMN last_message_at TIMESTAMP NULL DEFAULT NULL
+                """)
+
+        await cursor.execute("""
+            SHOW COLUMNS FROM rooms LIKE 'room_type'
+            """)
+        result = await cursor.fetchone()
+        if result:
+            print(f"✅ Column room_type already exists in rooms.")
+        else:
+            print(f"⚙️ Adding column room_type to rooms...")
+            await cursor.execute(f"""
+                ALTER TABLE rooms
+                ADD COLUMN room_type VARCHAR(16) NOT NULL DEFAULT 'group'
                 """)
 
         await cursor.execute("""
@@ -388,7 +402,7 @@ async def get_user_rooms(pool, user_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("""
-                SELECT r.id, r.name, r.description, r.last_message_at, ru.last_message_seen, r.owner_id, ru.silent_notifications
+                SELECT r.id, r.name, r.description, r.room_type, r.last_message_at, ru.last_message_seen, r.owner_id, ru.silent_notifications
                 FROM rooms r 
                 JOIN room_participants ru ON ru.room_id = r.id
                 WHERE ru.user_id = %s
@@ -625,44 +639,144 @@ async def clear_user_last_seen_msg(pool, user_id, room_id):
             await cursor.execute(sql, (room_id, user_id))
             await conn.commit()
 
-async def create_or_update_room(pool, user_id, room_name, user_ids, description, organization_id):
+def normalize_room_type(room_type, participant_count):
+    if isinstance(room_type, str):
+        room_type = room_type.strip().lower()
+    else:
+        room_type = None
+
+    aliases = {
+        "dm": "direct",
+        "direct_message": "direct",
+        "direct": "direct",
+        "group": "group",
+    }
+    mapped = aliases.get(room_type)
+    if mapped:
+        return mapped
+
+    if participant_count == 2:
+        return "direct"
+    return "group"
+
+async def resolve_user_ids(pool, raw_user_ids, creator_user_id, organization_id):
+    resolved = set()
+    for uid in raw_user_ids:
+        resolved_uid = uid
+        if not isinstance(uid, str) or uid.isdigit() == False:
+            resolved_uid = await get_user_id(uid, organization_id)
+        elif isinstance(uid, str):
+            resolved_uid = int(uid)
+        if resolved_uid is not None:
+            resolved.add(int(resolved_uid))
+    resolved.add(int(creator_user_id))
+    return list(resolved)
+
+async def find_existing_direct_room(pool, organization_id, user_a_id, user_b_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("""
+                SELECT r.id
+                FROM rooms r
+                JOIN room_participants rp ON rp.room_id = r.id
+                WHERE r.organization_id = %s
+                  AND r.room_type = 'direct'
+                GROUP BY r.id
+                HAVING COUNT(DISTINCT rp.user_id) = 2
+                   AND SUM(CASE WHEN rp.user_id = %s THEN 1 ELSE 0 END) > 0
+                   AND SUM(CASE WHEN rp.user_id = %s THEN 1 ELSE 0 END) > 0
+                ORDER BY r.id DESC
+                LIMIT 1
+            """, (int(organization_id), int(user_a_id), int(user_b_id)))
+            row = await cursor.fetchone()
+            return row["id"] if row else None
+
+async def ensure_room_participant(cursor, room_id, participant_id, organization_id):
+    await cursor.execute("""
+        SELECT id
+        FROM room_participants
+        WHERE room_id = %s
+          AND user_id = %s
+          AND organization_id = %s
+          AND deleted_at IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+    """, (room_id, participant_id, int(organization_id)))
+    existing_active = await cursor.fetchone()
+    if existing_active:
+        return
+
+    await cursor.execute("""
+        SELECT id
+        FROM room_participants
+        WHERE room_id = %s
+          AND user_id = %s
+          AND organization_id = %s
+        ORDER BY id DESC
+        LIMIT 1
+    """, (room_id, participant_id, int(organization_id)))
+    existing_any = await cursor.fetchone()
+    if existing_any:
+        await cursor.execute("""
+            UPDATE room_participants
+            SET deleted_at = NULL
+            WHERE id = %s
+        """, (existing_any[0],))
+        return
+
+    await cursor.execute("""
+        INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id)
+        VALUES (%s, %s, %s, %s)
+    """, (room_id, participant_id, 0, int(organization_id)))
+
+async def create_or_update_room(pool, user_id, room_name, user_ids, description, organization_id, requested_room_type=None):
+    participant_ids = await resolve_user_ids(pool, user_ids, user_id, organization_id)
+    room_type = normalize_room_type(requested_room_type, len(participant_ids))
+    if isinstance(requested_room_type, str) and requested_room_type.strip().lower() in {"dm", "direct_message", "direct"} and len(participant_ids) != 2:
+        return None, "direct"
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT id FROM rooms WHERE name = %s AND organization_id = %s", (room_name,organization_id))
+            if room_type == "direct" and len(participant_ids) == 2:
+                direct_room_id = await find_existing_direct_room(pool, organization_id, participant_ids[0], participant_ids[1])
+                if direct_room_id:
+                    for uid in participant_ids:
+                        await ensure_room_participant(cursor, direct_room_id, uid, organization_id)
+                    await conn.commit()
+                    return direct_room_id, room_type
+
+            await cursor.execute("SELECT id FROM rooms WHERE name = %s AND organization_id = %s", (room_name, organization_id))
             existing_room = await cursor.fetchone()
             if existing_room:
                 room_id = existing_room[0]
-                if await is_user_room_owner(pool, user_id, room_id, organization_id) == False :
-                    return None
-                # Update room info
-                if organization_id:
-                    await cursor.execute( "UPDATE rooms SET description = %s, name = %s WHERE id = %s", (description, room_name, room_id))
-                # Remove old users
+                if await is_user_room_owner(pool, user_id, room_id, organization_id) == False:
+                    return None, room_type
+                await cursor.execute(
+                    "UPDATE rooms SET description = %s, name = %s, room_type = %s WHERE id = %s",
+                    (description, room_name, room_type, room_id),
+                )
                 await cursor.execute("DELETE FROM room_participants WHERE room_id = %s", (room_id,))
             else:
-                # Insert new room
                 if organization_id:
-                    await cursor.execute( "INSERT INTO rooms (name, organization_id, description, owner_id) VALUES (%s, %s, %s, %s)", (room_name, int(organization_id), description, user_id))
+                    await cursor.execute(
+                        "INSERT INTO rooms (name, organization_id, description, owner_id, room_type) VALUES (%s, %s, %s, %s, %s)",
+                        (room_name, int(organization_id), description, user_id, room_type),
+                    )
                 else:
-                    await cursor.execute( "INSERT INTO rooms (name, description, owner_id) VALUES (%s,%s)", (room_name,description, user_id))
+                    await cursor.execute(
+                        "INSERT INTO rooms (name, description, owner_id, room_type) VALUES (%s, %s, %s, %s)",
+                        (room_name, description, user_id, room_type),
+                    )
                 room_id = cursor.lastrowid
 
-            # Add users to the room
-            found = False
-            for uid in user_ids:
-                if not isinstance(uid, str) or uid.isdigit() == False :
-                    uid = await get_user_id(uid, organization_id)
-                if uid is None:
-                    continue
-                if uid == user_id :
-                    found = True
-                await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, uid, 0, int( organization_id )))
-
-            if( found == False ):
-                await cursor.execute( "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)", (room_id, user_id, 0, int(organization_id)))
+            for uid in participant_ids:
+                await cursor.execute(
+                    "INSERT INTO room_participants (room_id, user_id, last_message_seen, organization_id) VALUES (%s, %s, %s, %s)",
+                    (room_id, uid, 0, int(organization_id)),
+                )
 
             await conn.commit()
-            return room_id
+            return room_id, room_type
 
 def isUserOnline( user_id ):
     for ws, info in connected_clients.items():
@@ -853,7 +967,7 @@ async def ws_handler( websocket ):
                             }))
                     continue
 
-                ## create a rooms param: session_token, name, users, description
+                ## create a rooms param: session_token, name, users, description, type(optional: group/direct)
                 if event == "UpdateOrMakeRoom":
                     data = theMessageContent.get("data")
                     session_token = data['session_token']
@@ -868,13 +982,17 @@ async def ws_handler( websocket ):
                     room_name = data["name"]
                     user_names = data["users"]
                     description = data["description"]
+                    requested_room_type = data.get("type")
                     org_id = client_info['organization_id']
-                    room_id = await create_or_update_room( pool, user_id, room_name, user_names, description, org_id )
+                    room_id, room_type = await create_or_update_room(
+                        pool, user_id, room_name, user_names, description, org_id, requested_room_type
+                    )
                     if room_id == None: 
                         await websocket.send(json.dumps({
                             "event":"update_or_make_room",
                             "data":{ 
                                 "room": room_id,
+                                "type": room_type,
                                 "status": "failed",
                                 "msg":"Failed to create a room"
                                 }
@@ -885,6 +1003,7 @@ async def ws_handler( websocket ):
                             "data":{
                                 "room": room_id,
                                 "name": room_name,
+                                "type": room_type,
                                 "status": "success"
                                 }
                             }))
