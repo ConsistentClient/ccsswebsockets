@@ -615,16 +615,19 @@ async def get_user_names_in_room(pool, room_id):
 async def mark_msg_not_read(pool, user_ids, room_id, msg_id):
     if not user_ids:
         return
-    placeholders = ','.join(['%s'] * len(user_ids))
+    batch_size = 250
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
-            sql = f"""
-                UPDATE room_participants 
-                SET last_message_seen = {msg_id} - 1
-                WHERE room_id = %s 
-                AND user_id IN ({placeholders})
-            """
-            await cursor.execute(sql, (room_id, *user_ids)) # TODO might be hard on the database if there are many people in room
+            for start in range(0, len(user_ids), batch_size):
+                batch_user_ids = user_ids[start:start + batch_size]
+                placeholders = ','.join(['%s'] * len(batch_user_ids))
+                sql = f"""
+                    UPDATE room_participants 
+                    SET last_message_seen = {msg_id} - 1
+                    WHERE room_id = %s 
+                    AND user_id IN ({placeholders})
+                """
+                await cursor.execute(sql, (room_id, *batch_user_ids))
             await conn.commit()
 
 async def clear_user_last_seen_msg(pool, user_id, room_id):
@@ -721,7 +724,7 @@ async def ensure_room_participant(cursor, room_id, participant_id, organization_
             UPDATE room_participants
             SET deleted_at = NULL
             WHERE id = %s
-        """, (existing_any[0],))
+        """, (existing_any[0] if not isinstance(existing_any, dict) else existing_any["id"],))
         return
 
     await cursor.execute("""
@@ -733,7 +736,7 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
     participant_ids = await resolve_user_ids(pool, user_ids, user_id, organization_id)
     room_type = normalize_room_type(requested_room_type, len(participant_ids))
     if isinstance(requested_room_type, str) and requested_room_type.strip().lower() in {"dm", "direct_message", "direct"} and len(participant_ids) != 2:
-        return None, "direct"
+        return None, "direct", "Direct rooms require exactly two valid participants in the same organization"
 
     async with pool.acquire() as conn:
         async with conn.cursor() as cursor:
@@ -743,14 +746,17 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
                     for uid in participant_ids:
                         await ensure_room_participant(cursor, direct_room_id, uid, organization_id)
                     await conn.commit()
-                    return direct_room_id, room_type
+                    return direct_room_id, room_type, None
 
-            await cursor.execute("SELECT id FROM rooms WHERE name = %s AND organization_id = %s", (room_name, organization_id))
-            existing_room = await cursor.fetchone()
+            existing_room = None
+            if room_type != "direct":
+                await cursor.execute("SELECT id FROM rooms WHERE name = %s AND organization_id = %s", (room_name, organization_id))
+                existing_room = await cursor.fetchone()
+
             if existing_room:
                 room_id = existing_room[0]
                 if await is_user_room_owner(pool, user_id, room_id, organization_id) == False:
-                    return None, room_type
+                    return None, room_type, "Only the room owner can update this room"
                 await cursor.execute(
                     "UPDATE rooms SET description = %s, name = %s, room_type = %s WHERE id = %s",
                     (description, room_name, room_type, room_id),
@@ -776,7 +782,7 @@ async def create_or_update_room(pool, user_id, room_name, user_ids, description,
                 )
 
             await conn.commit()
-            return room_id, room_type
+            return room_id, room_type, None
 
 def isUserOnline( user_id ):
     for ws, info in connected_clients.items():
@@ -984,7 +990,7 @@ async def ws_handler( websocket ):
                     description = data["description"]
                     requested_room_type = data.get("type")
                     org_id = client_info['organization_id']
-                    room_id, room_type = await create_or_update_room(
+                    room_id, room_type, error_message = await create_or_update_room(
                         pool, user_id, room_name, user_names, description, org_id, requested_room_type
                     )
                     if room_id == None: 
@@ -994,7 +1000,7 @@ async def ws_handler( websocket ):
                                 "room": room_id,
                                 "type": room_type,
                                 "status": "failed",
-                                "msg":"Failed to create a room"
+                                "msg": error_message or "Failed to create a room"
                                 }
                             }))
                     else:
