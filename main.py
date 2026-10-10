@@ -2,6 +2,9 @@
 
 import asyncio
 import json
+import hashlib
+import logging
+import os
 from aiohttp import web
 import websockets
 import mysql.connector
@@ -19,6 +22,69 @@ from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SERVE
 
 connected_clients = {}
 pool = None
+
+# StreamHandler writes to stderr, including INFO diagnostics in the service err log.
+notification_logger = logging.getLogger("firebase_notifications")
+notification_logger.setLevel(logging.INFO)
+notification_logger.propagate = False
+if not notification_logger.handlers:
+    notification_handler = logging.StreamHandler()
+    notification_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s [firebase_notifications] %(message)s"
+    ))
+    notification_logger.addHandler(notification_handler)
+
+
+def device_token_fingerprint(token):
+    if not isinstance(token, str) or not token.strip():
+        return "missing_or_invalid"
+    return hashlib.sha256(token.encode()).hexdigest()[:12]
+
+
+def notification_device_tokens(result, user_id, organization_id):
+    context = "user_id=%s organization_id=%s"
+    if not result:
+        notification_logger.warning("Push skipped: client row not found; " + context, user_id, organization_id)
+        return None
+    raw_tokens = result.get("device_token")
+    if raw_tokens is None:
+        notification_logger.warning("Push skipped: no device tokens registered; " + context, user_id, organization_id)
+        return None
+    try:
+        tokens = json.loads(raw_tokens)
+    except (json.JSONDecodeError, TypeError):
+        notification_logger.warning("Push skipped: invalid device_token JSON; " + context, user_id, organization_id)
+        return None
+    if not isinstance(tokens, list):
+        notification_logger.warning("Push skipped: device_token JSON must be a list; " + context, user_id, organization_id)
+        return None
+    notification_logger.info("Device token lookup: " + context + " token_count=%s", user_id, organization_id, len(tokens))
+    if not tokens:
+        notification_logger.warning("Push skipped: device token list is empty; " + context, user_id, organization_id)
+    return tokens
+
+
+def send_device_notifications(device_tokens, user_id, organization_id, title, body, data):
+    invalid_tokens = []
+    counts = {"ok": 0, "unregistered": 0, "error": 0}
+    for index, entry in enumerate(device_tokens):
+        token = entry.get("token") if isinstance(entry, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            notification_logger.warning(
+                "Device entry skipped: missing/invalid token user_id=%s organization_id=%s device_index=%s",
+                user_id, organization_id, index,
+            )
+            counts["error"] += 1
+            continue
+        status = send_push_notification(token, title, body, data, user_id, organization_id)
+        counts[status] += 1
+        if status == "unregistered":
+            invalid_tokens.append(token)
+    notification_logger.info(
+        "Push summary: user_id=%s organization_id=%s type=%s accepted=%s unregistered=%s failed_or_skipped=%s",
+        user_id, organization_id, data.get("type"), counts["ok"], counts["unregistered"], counts["error"],
+    )
+    return invalid_tokens
 
 async def init_db():
     notify_user = NOTIFY_USER
@@ -304,25 +370,18 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", 
                         (user_id, int(organization_id)))
             result = await cursor.fetchone()
-            json_device_tokens = result['device_token'] if result else None
-            if( json_device_tokens == None ) :
+            device_tokens = notification_device_tokens(result, user_id, organization_id)
+            if device_tokens is None:
                 return
-            try:
-                device_tokens = json.loads(json_device_tokens)
-            except json.JSONDecodeError:
-                print(f"    -->>   send_notifcation_message: Invalid device_token JSON for user {user_id}")
-                return
-            if not isinstance(device_tokens, list):
-                print(f"    -->>   send_notifcation_message: Invalid device_token payload for user {user_id}")
-                return
-            invalid_tokens = []
-            for tok in device_tokens:
-                print(f"    -->>   send_notifcation_message: Sending notification message to {user_id}")
-                status = send_push_notification( tok.get('token'), msg_title, msg_body, data )
-                if status == "unregistered":
-                    invalid_tokens.append(tok.get('token'))
+            invalid_tokens = send_device_notifications(
+                device_tokens, user_id, organization_id, msg_title, msg_body, data
+            )
             if invalid_tokens:
-                device_tokens = [t for t in device_tokens if t.get("token") not in invalid_tokens]
+                notification_logger.warning(
+                    "Removing unregistered device tokens: user_id=%s organization_id=%s count=%s",
+                    user_id, organization_id, len(invalid_tokens),
+                )
+                device_tokens = [t for t in device_tokens if not isinstance(t, dict) or t.get("token") not in invalid_tokens]
                 new_value = json.dumps(device_tokens) if device_tokens else None
                 await cursor.execute(
                     "UPDATE clients SET device_token = %s WHERE id = %s AND organization_id = %s",
@@ -339,26 +398,18 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("SELECT device_token FROM clients WHERE id = %s AND organization_id = %s", (user_id, int(organization_id)))
             result = await cursor.fetchone()
-            json_device_tokens = result['device_token'] if result else None
-            if( json_device_tokens == None ) :
+            device_tokens = notification_device_tokens(result, user_id, organization_id)
+            if device_tokens is None:
                 return
-    
-            try:
-                device_tokens = json.loads(json_device_tokens)
-            except json.JSONDecodeError:
-                print(f"send_notifcation_message: Invalid device_token JSON for user {user_id}")
-                return
-            if not isinstance(device_tokens, list):
-                print(f"send_notifcation_message: Invalid device_token payload for user {user_id}")
-                return
-            invalid_tokens = []
-            for tok in device_tokens:
-                print(f"send_notifcation_message: Sending notification message to {user_id} ")
-                status = send_push_notification( tok.get('token'), msg_title, msg_body, data )
-                if status == "unregistered":
-                    invalid_tokens.append(tok.get('token'))
+            invalid_tokens = send_device_notifications(
+                device_tokens, user_id, organization_id, msg_title, msg_body, data
+            )
             if invalid_tokens:
-                device_tokens = [t for t in device_tokens if t.get("token") not in invalid_tokens]
+                notification_logger.warning(
+                    "Removing unregistered device tokens: user_id=%s organization_id=%s count=%s",
+                    user_id, organization_id, len(invalid_tokens),
+                )
+                device_tokens = [t for t in device_tokens if not isinstance(t, dict) or t.get("token") not in invalid_tokens]
                 new_value = json.dumps(device_tokens) if device_tokens else None
                 await cursor.execute(
                     "UPDATE clients SET device_token = %s WHERE id = %s AND organization_id = %s",
@@ -793,7 +844,7 @@ def isUserOnline( user_id ):
 async def send_general_notification_msg_to_users( pool, message, user_id, organization_id, msg_title, msg_body ):
     tasks = []
     found = False
-    print(f"   -->>    In function send_general_notification_msg_to_users {user_id} ")
+    notification_logger.info("Routing notification: user_id=%s organization_id=%s", user_id, organization_id)
     for ws, info in connected_clients.items():
         ws_user_id = info.get("user_id")
         if(user_id == ws_user_id) :
@@ -802,11 +853,22 @@ async def send_general_notification_msg_to_users( pool, message, user_id, organi
             break
 
     if found == False:
-        print(f"    -->>   sending to {user_id} is offline using firebase")
+        notification_logger.info("Recipient offline: routing to Firebase user_id=%s organization_id=%s", user_id, organization_id)
         await send_general_notifcation_message( pool, user_id, organization_id, msg_title, msg_body, message ) 
     if tasks:
-        print(f"   -->>    sending to {user_id} is online - using websockets")
-        await asyncio.gather(*tasks, return_exceptions=True)
+        notification_logger.info(
+            "Firebase skipped: recipient has an active WebSocket user_id=%s organization_id=%s",
+            user_id, organization_id,
+        )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                notification_logger.error(
+                    "WebSocket notification failed: user_id=%s organization_id=%s error_type=%s error=%s",
+                    user_id, organization_id, type(result).__name__, result,
+                )
+            else:
+                notification_logger.info("WebSocket notification sent: user_id=%s organization_id=%s", user_id, organization_id)
 
 async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
     tasks = []
@@ -894,9 +956,14 @@ async def ws_handler( websocket ):
 
                 ## send notifications to clients
                 if event == "notification":
+                    notification_logger.info(
+                        "Notification request received: sender_user_id=%s sender_organization_id=%s target_organization_id=%s",
+                        client_info.get("user_id"), client_info.get("organization_id"), theMessageContent.get("organization_id"),
+                    )
                     data = theMessageContent.get("data") or {}
                     session_token = data.get('session_token')
                     if client_info['session_token'] != session_token :
+                        notification_logger.warning("Notification rejected: invalid session token sender_user_id=%s", client_info.get("user_id"))
                         print(f"{client_ip}: invalid token Session token is invalid")
                         await websocket.send(json.dumps({
                             "error":"invalid token",
@@ -906,6 +973,7 @@ async def ws_handler( websocket ):
 
                     organization_id = theMessageContent.get("organization_id")
                     if organization_id is None:
+                        notification_logger.warning("Notification rejected: missing organization_id")
                         print(f"{client_ip}: invalid organization id")
                         await websocket.send(json.dumps({
                             "error":"invalid organization id",
@@ -915,6 +983,7 @@ async def ws_handler( websocket ):
 
                     org_id = client_info['organization_id']
                     if int(org_id) > 0 and int(org_id) != int(organization_id) :
+                        notification_logger.warning("Notification rejected: organization mismatch sender_organization_id=%s target_organization_id=%s", org_id, organization_id)
                         print(f"{client_ip}: invalid organization id does not match client organization id")
                         await websocket.send(json.dumps({
                             "error":"invalid organization id",
@@ -937,7 +1006,7 @@ async def ws_handler( websocket ):
                             "data": {
                                 "title": msg_title,
                                 "body": msg_body,
-                                "message": data['notification'],
+                                "message": payload,
                             }
                         })
                         await send_general_notification_msg_to_users(pool, notification_message, user_id, organization_id, msg_title, msg_body)
@@ -945,6 +1014,7 @@ async def ws_handler( websocket ):
                             "event":"notification_success",
                             }))
                     else :
+                        notification_logger.warning("Notification rejected: target username not found organization_id=%s", organization_id)
                         print(f"{client_ip}: username is not found")
                         await websocket.send( json.dumps({
                             "event":"notification_failed",
@@ -1362,13 +1432,14 @@ async def ws_handler( websocket ):
 
             except Exception as outer_err:
                 # Catch websocket errors (disconnects, etc.)
+                notification_logger.exception("WebSocket request failed: event=%s sender_user_id=%s", theMessageContent.get("event"), connected_clients.get(websocket, {}).get("user_id"))
                 print(f"WebSocket error: {outer_err}")
     except websockets.ConnectionClosed:
         pass
     finally:
         connected_clients.pop(websocket, None)
 
-def send_push_notification(token, title, body, data=None):
+def send_push_notification(token, title, body, data=None, user_id=None, organization_id=None):
     """
     Sends a push notification to a specific device via FCM.
     :param token: The FCM device registration token.
@@ -1376,29 +1447,31 @@ def send_push_notification(token, title, body, data=None):
     :param body: Notification body.
     :param data: Optional custom key/value payload (dict).
     """
-    # Create the message
-    message = messaging.Message(
-        notification=messaging.Notification(
-            title=title,
-            body=body,
-        ),
-        token=token,
-        data=data or {}
-    )
-
-    # Send message
+    context = "user_id=%s organization_id=%s token_fingerprint=%s"
+    context_args = (user_id, organization_id, device_token_fingerprint(token))
     try:
+        app = firebase_admin.get_app()
+        notification_logger.info(
+            "FCM send attempt: " + context + " project_id=%s type=%s title_present=%s body_present=%s data_bytes=%s",
+            *context_args, app.project_id, (data or {}).get("type"), bool(title), bool(body),
+            len(json.dumps(data or {}).encode()),
+        )
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            token=token,
+            data=data or {},
+        )
         response = messaging.send(message)
-        print(f"✅ Successfully sent message with token: {token} response:  {response}")
+        notification_logger.info("FCM accepted (device display not confirmed): " + context + " message_id=%s", *context_args, response)
         return "ok"
     except messaging.UnregisteredError as e:
-        print(f"FCM token unregistered: {token} error: {e}")
+        notification_logger.exception("FCM token unregistered: " + context + " code=%s", *context_args, getattr(e, "code", None))
         return "unregistered"
     except exceptions.FirebaseError as e:
-        print(f"FCM send error for token {token}: {e}")
+        notification_logger.exception("FCM send failed: " + context + " code=%s", *context_args, getattr(e, "code", None))
         return "error"
     except Exception as e:
-        print(f"Unexpected FCM error for token {token}: {e}")
+        notification_logger.exception("FCM unexpected failure: " + context + " error_type=%s", *context_args, type(e).__name__)
         return "error"
 
 
@@ -1421,25 +1494,30 @@ async def main():
     global pool
 
     try:
+        notification_logger.info("Firebase initialization: credentials_path=%s database=%s", os.path.abspath("firebase_credentials.json"), DB_NAME)
         cred = credentials.Certificate("firebase_credentials.json")
-        firebase_admin.initialize_app(cred)
-        print("Firebase initialized successfully")
+        app = firebase_admin.initialize_app(cred)
+        notification_logger.info("Firebase initialized: project_id=%s", app.project_id)
 
     except ValueError as e:
-        # Happens if Firebase app is already initialized
-        print("Firebase already initialized:", e)
+        # ValueError can also indicate invalid credentials, not just an existing app.
+        notification_logger.exception("Firebase initialization ValueError")
+        try:
+            notification_logger.info("Existing Firebase app: project_id=%s", firebase_admin.get_app().project_id)
+        except ValueError:
+            notification_logger.error("Firebase unavailable: no initialized app; push attempts will fail")
 
     except FileNotFoundError as e:
         # Happens if the service account file path is wrong
-        print("Credential file not found:", e)
+        notification_logger.exception("Firebase credential file not found")
 
     except exceptions.FirebaseError as e:
         # Catches Firebase-specific errors (e.g., invalid credentials)
-        print("Firebase initialization error:", e)
+        notification_logger.exception("Firebase initialization error: code=%s", getattr(e, "code", None))
 
     except Exception as e:
         # Generic catch-all for anything unexpected
-        print("Unexpected error:", e)
+        notification_logger.exception("Firebase unexpected initialization failure")
 
     await init_db()
     pool = await create_pool()
