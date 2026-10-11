@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, messaging
 from firebase_admin import exceptions  
+from pbx_notifications import CallNotificationDispatcher, create_pbx_app
 
 # config file local
 import config
@@ -22,6 +23,8 @@ from config import SERVER_IP, DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SERVE
 
 connected_clients = {}
 pool = None
+call_notification_dispatcher = None
+call_notification_tasks = set()
 
 # StreamHandler writes to stderr, including INFO diagnostics in the service err log.
 notification_logger = logging.getLogger("firebase_notifications")
@@ -282,6 +285,39 @@ async def init_db():
                 ADD COLUMN active INT DEFAULT 30
                 """)
 
+        # One client per (organization, username). dev_ccss used to create a second row when an employee
+        # was saved from another organization's context; this index makes that impossible.
+        await cursor.execute("SHOW INDEX FROM clients WHERE Key_name = 'clients_organization_username_unique'")
+        result = await cursor.fetchone()
+        if result:
+            print("✅ Unique index on clients (organization_id, username) already exists.")
+        else:
+            await cursor.execute(
+                """
+                SELECT organization_id, username, COUNT(*)
+                FROM clients
+                WHERE username IS NOT NULL
+                GROUP BY organization_id, username
+                HAVING COUNT(*) > 1
+                LIMIT 20
+                """
+            )
+            duplicates = await cursor.fetchall()
+            if duplicates:
+                # Rooms and messages point at a client id, so merging needs a person; startup must not fail.
+                print("⚠️ Unique index on clients (organization_id, username) not added; remove these duplicates first "
+                      "(see dev_ccss docs/chat-client-duplicates.md): "
+                      + ", ".join(f"{row[1]} (organization {row[0]})" for row in duplicates))
+            else:
+                try:
+                    print("⚙️ Adding unique index on clients (organization_id, username)...")
+                    # A prefix keeps the key within the index size limit of every row format.
+                    await cursor.execute(
+                        "CREATE UNIQUE INDEX clients_organization_username_unique ON clients (organization_id, username(191))"
+                    )
+                except Exception as error:
+                    print(f"⚠️ Could not add unique index on clients (organization_id, username): {error}")
+
         if notify_user and notify_user_path:
             await cursor.execute(
                 """
@@ -296,11 +332,13 @@ async def init_db():
             if result:
                 print("✅ Notify user already exists in clients.")
             else:
+                # With the unique index, a changed NOTIFY_USER_PATH updates the existing row instead of failing.
                 print("⚙️ Adding notify user to clients...")
                 await cursor.execute(
                     """
                     INSERT INTO clients (username, token, organization_id)
                     VALUES (%s, %s, 0)
+                    ON DUPLICATE KEY UPDATE token = VALUES(token)
                     """,
                     (notify_user, notify_user_path),
                 )
@@ -713,6 +751,13 @@ def normalize_room_type(room_type, participant_count):
         return "direct"
     return "group"
 
+async def get_user_id_in_organization(pool, user_id, organization_id):
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await cursor.execute("SELECT id FROM clients WHERE id = %s AND organization_id = %s", (user_id, int(organization_id)))
+            user = await cursor.fetchone()
+            return user['id'] if user else None
+
 async def resolve_user_ids(pool, raw_user_ids, creator_user_id, organization_id):
     resolved = set()
     for uid in raw_user_ids:
@@ -720,7 +765,8 @@ async def resolve_user_ids(pool, raw_user_ids, creator_user_id, organization_id)
         if not isinstance(uid, str) or uid.isdigit() == False:
             resolved_uid = await get_user_id(uid, organization_id)
         elif isinstance(uid, str):
-            resolved_uid = int(uid)
+            # Numeric IDs must belong to the creator's organization, like usernames.
+            resolved_uid = await get_user_id_in_organization(pool, int(uid), organization_id)
         if resolved_uid is not None:
             resolved.add(int(resolved_uid))
     resolved.add(int(creator_user_id))
@@ -876,7 +922,8 @@ async def send_msg_to_users( pool, message, user_ids, organization_id, room_id )
         found = False
         for ws, info in connected_clients.items():
             ws_user_id = info.get("user_id")
-            if(user_id == ws_user_id) :
+            # Never deliver to a participant from another organization.
+            if(user_id == ws_user_id and info.get("organization_id") == organization_id) :
                 found = True
                 tasks.append(ws.send(message))
                 break
@@ -887,6 +934,19 @@ async def send_msg_to_users( pool, message, user_ids, organization_id, room_id )
         await asyncio.gather(*tasks, return_exceptions=True)
 
 # WebSocket server
+async def send_call_notification(websocket, payload):
+    try:
+        status, reply = await call_notification_dispatcher.dispatch(payload)
+        # Replies can arrive out of order; call_id lets the sender match them.
+        reply = dict({"call_id": payload.get("call_id")}, **reply)
+        reply["event"] = "call_notification_success" if status == 200 else "call_notification_failed"
+        await websocket.send(json.dumps(reply))
+    except websockets.ConnectionClosed:
+        pass
+    except Exception:
+        notification_logger.exception("Call notification reply failed: call_id=%s", payload.get("call_id"))
+
+
 async def ws_handler( websocket ):
     global pool
 
@@ -911,7 +971,6 @@ async def ws_handler( websocket ):
     try:
         async for message in websocket:
             try:
-                print(f"Got message {message}")
                 theMessageContent = json.loads(message)
             except json.JSONDecodeError:
                 await websocket.send(json.dumps({"error": "Invalid JSON"}))
@@ -952,6 +1011,38 @@ async def ws_handler( websocket ):
                         await websocket.send(json.dumps({
                             "event":"register_error",
                             "data":"You must send a register event first"}))                
+                    continue
+
+                if event == "call_notification":
+                    data = theMessageContent.get("data") or {}
+                    # Encoded so a non-ASCII token is rejected rather than raising.
+                    if not isinstance(data, dict) or not secrets.compare_digest(
+                        str(data.get("session_token", "")).encode(), str(client_info["session_token"]).encode()
+                    ):
+                        await websocket.send(json.dumps({"event": "call_notification_failed", "error": "invalid_session"}))
+                        continue
+                    # Only the shared notification account (organization 0) may
+                    # raise call alerts; ordinary chat users cannot.
+                    if int(client_info.get("organization_id") or 0) != 0:
+                        notification_logger.warning("Call notification rejected: sender is not the notification account sender_user_id=%s", client_info.get("user_id"))
+                        await websocket.send(json.dumps({"event": "call_notification_failed", "error": "recipient_not_authorized"}))
+                        continue
+                    organization_id = theMessageContent.get("organization_id")
+                    try:
+                        # Same coercion as the notification event, which accepts string IDs.
+                        organization_id = None if isinstance(organization_id, bool) else int(organization_id)
+                    except (TypeError, ValueError):
+                        organization_id = None
+                    payload = {
+                        "username": theMessageContent.get("username"),
+                        "organization_id": organization_id,
+                        **{key: data.get(key) for key in ("call_id", "caller_name", "caller_number", "extension")},
+                    }
+                    # Dispatched in the background so a slow push does not hold up
+                    # later alerts on the shared notification connection.
+                    task = asyncio.create_task(send_call_notification(websocket, payload))
+                    call_notification_tasks.add(task)
+                    task.add_done_callback(call_notification_tasks.discard)
                     continue
 
                 ## send notifications to clients
@@ -1461,6 +1552,14 @@ def send_push_notification(token, title, body, data=None, user_id=None, organiza
             token=token,
             data=data or {},
         )
+        if (data or {}).get("type") == "incoming_call":
+            # A short-lived ordinary alert, not a PushKit VoIP push.
+            message.android = messaging.AndroidConfig(priority="high", ttl=timedelta(seconds=30))
+            message.apns = messaging.APNSConfig(
+                headers={"apns-push-type": "alert", "apns-priority": "10",
+                         "apns-expiration": str(int(datetime.now().timestamp()) + 30)},
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+            )
         response = messaging.send(message)
         notification_logger.info("FCM accepted (device display not confirmed): " + context + " message_id=%s", *context_args, response)
         return "ok"
@@ -1491,7 +1590,7 @@ async def http_sendmessage(request):
     return web.json_response({"status": "ok"})
 
 async def main():
-    global pool
+    global pool, call_notification_dispatcher
 
     try:
         notification_logger.info("Firebase initialization: credentials_path=%s database=%s", os.path.abspath("firebase_credentials.json"), DB_NAME)
@@ -1521,22 +1620,42 @@ async def main():
 
     await init_db()
     pool = await create_pool()
+    call_notification_dispatcher = CallNotificationDispatcher(
+        pool, notification_device_tokens, send_push_notification, notification_logger,
+    )
 
     # Start WebSocket server on port 8080
     #ws_server = await websockets.serve(lambda ws, path:ws_handler(ws, path, pool), SERVER_IP, 8080)
     ws_server = await websockets.serve(ws_handler, SERVER_IP, SERVER_PORT)
 
-    # Start HTTP server on port 8081
-    #app = web.Application()
-    #app.add_routes([web.post('/sendmessage', http_sendmessage)])
-    #runner = web.AppRunner(app)
-    #await runner.setup()
-    #site = web.TCPSite(runner, SERVER_IP, 8081)
-    #await site.start()
+    runner = None
+    pbx_secret = getattr(config, "PBX_NOTIFICATION_SECRET", "")
+    if pbx_secret:
+        pbx_host = getattr(config, "PBX_NOTIFICATION_HOST", "127.0.0.1")
+        pbx_port = getattr(config, "PBX_NOTIFICATION_PORT", 8081)
+        # Shares the WebSocket dispatcher so deduplication covers both transports.
+        runner = web.AppRunner(create_pbx_app(call_notification_dispatcher, pbx_secret, notification_logger))
+        try:
+            await runner.setup()
+            await web.TCPSite(runner, pbx_host, pbx_port).start()
+            notification_logger.info("PBX notifications listening: host=%s port=%s", pbx_host, pbx_port)
+        except OSError:
+            # The fallback is optional; chat and WebSocket alerts keep running without it.
+            notification_logger.exception("PBX HTTP fallback failed to start: host=%s port=%s", pbx_host, pbx_port)
+            await runner.cleanup()
+            runner = None
+    else:
+        notification_logger.info("PBX HTTP fallback disabled: PBX_NOTIFICATION_SECRET is not configured; WebSocket call notifications enabled")
 
     print(f"WebSocket: ws://{SERVER_IP}:{SERVER_PORT}")
     #print("HTTP POST: http://{SERVER_IP}:8081/sendmessage")
-    await asyncio.Future()  # run forever
+    try:
+        await asyncio.Future()  # run forever
+    finally:
+        if runner is not None:
+            await runner.cleanup()
+        ws_server.close()
+        await ws_server.wait_closed()
 
 
 asyncio.run(main())
