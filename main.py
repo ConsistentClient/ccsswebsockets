@@ -11,11 +11,13 @@ import mysql.connector
 import aiomysql
 from functools import partial
 import secrets
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, messaging
 from firebase_admin import exceptions  
 from pbx_notifications import CallNotificationDispatcher, create_pbx_app
+from chat_http import create_chat_app
 
 # config file local
 import config
@@ -1647,6 +1649,36 @@ async def main():
     else:
         notification_logger.info("PBX HTTP fallback disabled: PBX_NOTIFICATION_SECRET is not configured; WebSocket call notifications enabled")
 
+    chat_runner = None
+    chat_secret = getattr(config, "CHAT_HTTP_SECRET", "")
+    if chat_secret:
+        chat_host = getattr(config, "CHAT_HTTP_HOST", "127.0.0.1")
+        chat_port = getattr(config, "CHAT_HTTP_PORT", 8082)
+        # The same operations the WebSocket events use, so both transports behave alike.
+        chat_operations = SimpleNamespace(
+            get_user_rooms=get_user_rooms, create_or_update_room=create_or_update_room,
+            get_room_owner=get_room_owner, get_user_names_in_room=get_user_names_in_room,
+            leave_room=leave_room, silent_room=silent_room, unsilent_room=unsilent_room,
+            update_last_seen_msg_in_room=update_last_seen_msg_in_room, clear_user_last_seen_msg=clear_user_last_seen_msg,
+            get_prev_messages_in_room=get_prev_messages_in_room, get_last_messages_in_room=get_last_messages_in_room,
+            get_users_in_room=get_users_in_room, store_new_message=store_new_message,
+            edit_message_in_room=edit_message_in_room, delete_message_in_room=delete_message_in_room,
+            send_msg_to_users=send_msg_to_users, is_user_online=isUserOnline,
+            send_general_notification_msg_to_users=send_general_notification_msg_to_users,
+        )
+        chat_runner = web.AppRunner(create_chat_app(pool, chat_secret, notification_logger, chat_operations))
+        try:
+            await chat_runner.setup()
+            await web.TCPSite(chat_runner, chat_host, chat_port).start()
+            notification_logger.info("Chat HTTP polling listening: host=%s port=%s", chat_host, chat_port)
+        except OSError:
+            # Optional like the PBX fallback; WebSocket chat keeps running without it.
+            notification_logger.exception("Chat HTTP polling failed to start: host=%s port=%s", chat_host, chat_port)
+            await chat_runner.cleanup()
+            chat_runner = None
+    else:
+        notification_logger.info("Chat HTTP polling disabled: CHAT_HTTP_SECRET is not configured")
+
     print(f"WebSocket: ws://{SERVER_IP}:{SERVER_PORT}")
     #print("HTTP POST: http://{SERVER_IP}:8081/sendmessage")
     try:
@@ -1654,6 +1686,8 @@ async def main():
     finally:
         if runner is not None:
             await runner.cleanup()
+        if chat_runner is not None:
+            await chat_runner.cleanup()
         ws_server.close()
         await ws_server.wait_closed()
 
