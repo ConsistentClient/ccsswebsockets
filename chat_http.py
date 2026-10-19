@@ -1,7 +1,8 @@
 """HTTP version of the WebSocket chat events, for servers that cannot hold a WebSocket open.
 
-A trusted service authenticates with a shared secret and acts as a chat user named by
-username and organization_id. Chat operations come from main.py through `chat`, so HTTP
+Each request acts as the chat user named by username and organization_id, and must carry that
+user's chat token (clients.token) as `Authorization: Bearer <token>`: the credentials the
+WebSocket Register event checks. Chat operations come from main.py through `chat`, so HTTP
 messages are stored, relayed to WebSocket sessions and pushed exactly like WebSocket ones.
 """
 
@@ -42,7 +43,7 @@ async def find_user(pool, username, organization_id):
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute(
-                "SELECT id, username FROM clients WHERE username = %s AND organization_id = %s LIMIT 1",
+                "SELECT id, username, token FROM clients WHERE username = %s AND organization_id = %s LIMIT 1",
                 (username, organization_id),
             )
             return await cursor.fetchone()
@@ -116,13 +117,13 @@ def _message_fields(params):
     return message, msginfo, None
 
 
-def create_chat_app(pool, secret, logger, chat):
+def create_chat_app(pool, logger, chat):
     def endpoint(handler, room_scoped=False):
         async def wrapped(request):
             authorization = request.headers.get("Authorization", "")
-            if not secret or not hmac.compare_digest(authorization.encode(), ("Bearer " + secret).encode()):
-                logger.warning("Chat HTTP request rejected: invalid service authentication path=%s", request.path)
-                return _error(401, "unauthorized")
+            token = authorization[len("Bearer "):] if authorization.startswith("Bearer ") else ""
+            if not token:
+                return _error(401, "missing_token")
 
             params = dict(request.query)
             if request.method == "POST" and request.can_read_body:
@@ -143,8 +144,13 @@ def create_chat_app(pool, secret, logger, chat):
 
             try:
                 user = await find_user(pool, username, organization_id)
-                if not user:
-                    return _error(404, "user_not_found")
+                # Unknown users and wrong tokens get the same answer, so usernames cannot be probed.
+                if not user or not user.get("token") or not hmac.compare_digest(
+                    str(user["token"]).encode(), token.encode()
+                ):
+                    logger.warning("Chat HTTP request rejected: invalid credentials organization_id=%s path=%s",
+                                   organization_id, request.path)
+                    return _error(401, "invalid_credentials")
                 ctx = SimpleNamespace(user=user, user_id=user["id"], organization_id=organization_id,
                                       params=params, room_id=None, participant=None)
                 if room_scoped:

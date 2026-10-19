@@ -7,28 +7,26 @@ Every WebSocket chat event has an HTTP equivalent, so a server such as `dev_ccss
 Add to `config.py` and restart the service:
 
 ```python
-CHAT_HTTP_SECRET = "a-long-random-secret"
+CHAT_HTTP_PORT = 8082
 CHAT_HTTP_HOST = "127.0.0.1"   # default
-CHAT_HTTP_PORT = 8082          # default
 ```
 
-With no `CHAT_HTTP_SECRET`, the listener is disabled. If the port cannot be bound, the error is logged and WebSocket chat keeps running. Keep it on localhost or a private network. This is a service-to-service API: whoever holds the secret can act as any chat user.
+With no `CHAT_HTTP_PORT`, the listener is disabled. If the port cannot be bound, the error is logged and WebSocket chat keeps running. Every request needs the user's own chat token (see [Requests](#requests)), so the API grants nothing that user's WebSocket `Register` would not.
 
 ### Several instances on one server
 
-Each instance has its own `config.py`. Give each one its own `CHAT_HTTP_PORT` and its own `CHAT_HTTP_SECRET`. With the default port, only the first instance gets the listener; the others log `Chat HTTP polling failed to start` and run without it. The same applies to `PBX_NOTIFICATION_PORT` if the PBX fallback is enabled.
+Each instance has its own `config.py`. Give each one its own `CHAT_HTTP_PORT`. An instance whose port is taken logs `Chat HTTP polling failed to start` and runs without the listener. The same applies to `PBX_NOTIFICATION_PORT` if the PBX fallback is enabled.
 
 ```python
 # instance 1                        # instance 2
 SERVER_PORT = 8765                  SERVER_PORT = 8865
 CHAT_HTTP_PORT = 8082               CHAT_HTTP_PORT = 8182
-CHAT_HTTP_SECRET = "secret-1"       CHAT_HTTP_SECRET = "secret-2"
 ```
 
 The listener binds to `127.0.0.1`, so it is reachable from the same server only:
 
 - **dev_ccss on the same server:** point its `CHAT_HTTP_URL` straight at the instance (`http://127.0.0.1:8082`). nginx is not needed for this.
-- **dev_ccss on another server:** add an nginx location per instance next to its WebSocket location. Allow only the dev_ccss server's IP, and serve it over HTTPS because the secret travels in the `Authorization` header. The trailing `/` on `proxy_pass` removes the prefix, so the service receives `/chat/...`. Then set `CHAT_HTTP_URL=https://chat.example.com/ws1-http`.
+- **dev_ccss on another server:** add an nginx location per instance next to its WebSocket location, and serve it over HTTPS, because user tokens travel in the `Authorization` header. dev_ccss appends `?token=<NOTIFICATION_WS_QUERY_TOKEN>` unencoded, so the location can check it the way the WebSocket location does. Allowing only the dev_ccss server's IP keeps everyone else off it entirely. The trailing `/` on `proxy_pass` removes the prefix, so the service receives `/chat/...`. Then set `CHAT_HTTP_URL=https://chat.example.com/ws1-http`.
 
 ```nginx
 # Instance 1: existing WebSocket location, unchanged
@@ -54,7 +52,7 @@ Repeat both locations for each instance with its own prefix and ports.
 
 ## Requests
 
-Every request sends `Authorization: Bearer <CHAT_HTTP_SECRET>` and names the user it acts as with `username` and `organization_id`. This replaces the WebSocket `Register` event and session token.
+Every request names the user it acts as with `username` and `organization_id`, and sends that user's chat token (`clients.token`) as `Authorization: Bearer <token>`. These are the credentials the WebSocket `Register` event checks; HTTP has no separate session. A missing token returns `401 missing_token`, and an unknown user or wrong token returns `401 invalid_credentials`. The two cases look the same so usernames cannot be probed. A `token` query parameter (nginx's) is ignored.
 
 - **GET:** parameters go in the query string.
 - **POST:** parameters go in a JSON body. Query string parameters are also accepted; the body wins when both are given. An empty body is allowed when there is nothing else to send.
@@ -67,7 +65,7 @@ Room endpoints (`/chat/rooms/{room}/…`) require the user to be an active parti
 | --- | --- | --- | --- |
 | `Ping` | `GET /chat/ping` | | `{"status": true, "user_id": 7}` |
 | `GetUserStatus` | `GET /chat/user-status` | | `{"user_id": 7, "online": true}` (online = has an open WebSocket) |
-| `notification` | `POST /chat/notifications` | `title`, `body`, `data` | `{"success": true}`; `username` is the recipient |
+| `notification` | `POST /chat/notifications` | `title`, `body`, `data` | `{"success": true}`; `username` is the recipient, and the token must be theirs |
 | `GetRooms` | `GET /chat/rooms` | | `{"rooms": [...]}` |
 | `UpdateOrMakeRoom` | `POST /chat/rooms` | `name`, `users` (array of usernames or IDs), `description`, `type` (`group`/`direct`, optional) | `{"status": "success", "room": 5, "name": "Ops", "type": "group"}`, or `422` with `error` |
 | `GetUsersInRoom` | `GET /chat/rooms/{room}/users` | | `{"room": 1, "users": [...], "owners": [...]}` |
@@ -129,19 +127,19 @@ Messages are oldest first. If `last_id` is omitted, the user's `last_message_see
 | Status | `error` |
 | --- | --- |
 | 400 | `invalid_json`, `expected_json_object`, `invalid_organization_id`, `invalid_username`, `invalid_room`, `invalid_last_id`, `invalid_before_id`, `invalid_limit`, `invalid_msg_id`, `invalid_message`, `invalid_msginfo`, `invalid_name`, `invalid_users`, `invalid_description`, `invalid_type` |
-| 401 | `unauthorized` |
+| 401 | `missing_token`, `invalid_credentials` |
 | 403 | `not_a_participant` |
-| 404 | `user_not_found` |
 | 422 | room creation/update refused (`error` holds the reason) |
 | 500 | `request_failed` (details in the service log) |
 
 ## Laravel example
 
 ```php
-$chat = Http::withToken(config('services.chat_http.secret'))
+$client = ConversationClients::forUser($organizationId, $username)->first();
+$chat = Http::withToken($client->token)
     ->baseUrl(config('services.chat_http.url'))
     ->timeout(10);
-$who = ['username' => $employee->username, 'organization_id' => $employee->organization_id];
+$who = ['username' => $client->username, 'organization_id' => $organizationId];
 
 $unread = $chat->get('/chat/unread', $who)->json();
 
@@ -152,5 +150,7 @@ $sent = $chat->post("/chat/rooms/{$roomId}/messages", $who + [
 
 $chat->post("/chat/rooms/{$roomId}/last-seen", $who + ['msg_id' => $sent['msgid']]);
 ```
+
+dev_ccss's `ChatHttpClient` does this for the signed-in user and also appends the nginx query token.
 
 Sending a message waits for Firebase pushes to offline recipients before it responds, as over WebSocket, so allow a timeout of several seconds.

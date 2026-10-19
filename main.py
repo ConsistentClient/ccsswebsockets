@@ -1650,10 +1650,11 @@ async def main():
         notification_logger.info("PBX HTTP fallback disabled: PBX_NOTIFICATION_SECRET is not configured; WebSocket call notifications enabled")
 
     chat_runner = None
-    chat_secret = getattr(config, "CHAT_HTTP_SECRET", "")
-    if chat_secret:
+    # No default port: instances sharing a server each need their own.
+    chat_port = getattr(config, "CHAT_HTTP_PORT", None)
+    if chat_port:
+        # The API has no credentials; keep it on localhost unless nginx restricts access.
         chat_host = getattr(config, "CHAT_HTTP_HOST", "127.0.0.1")
-        chat_port = getattr(config, "CHAT_HTTP_PORT", 8082)
         # The same operations the WebSocket events use, so both transports behave alike.
         chat_operations = SimpleNamespace(
             get_user_rooms=get_user_rooms, create_or_update_room=create_or_update_room,
@@ -1666,7 +1667,7 @@ async def main():
             send_msg_to_users=send_msg_to_users, is_user_online=isUserOnline,
             send_general_notification_msg_to_users=send_general_notification_msg_to_users,
         )
-        chat_runner = web.AppRunner(create_chat_app(pool, chat_secret, notification_logger, chat_operations))
+        chat_runner = web.AppRunner(create_chat_app(pool, notification_logger, chat_operations))
         try:
             await chat_runner.setup()
             await web.TCPSite(chat_runner, chat_host, chat_port).start()
@@ -1677,7 +1678,7 @@ async def main():
             await chat_runner.cleanup()
             chat_runner = None
     else:
-        notification_logger.info("Chat HTTP polling disabled: CHAT_HTTP_SECRET is not configured")
+        notification_logger.info("Chat HTTP polling disabled: CHAT_HTTP_PORT is not configured")
 
     print(f"WebSocket: ws://{SERVER_IP}:{SERVER_PORT}")
     #print("HTTP POST: http://{SERVER_IP}:8081/sendmessage")

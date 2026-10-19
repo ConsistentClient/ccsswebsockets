@@ -57,7 +57,7 @@ class Connection:
 
 class Pool:
     def __init__(self):
-        self.user = {'id': 7, 'username': 'george'}
+        self.user = {'id': 7, 'username': 'george', 'token': 'user-token'}
         self.participant = {'last_message_seen': 10}
         self.rooms = [
             {'room': 1, 'name': 'Ops', 'room_type': 'group', 'last_message_at': datetime(2026, 10, 19, 9, 0),
@@ -77,6 +77,10 @@ class Pool:
         return Connection(self)
 
 
+def AUTH(token):
+    return {'Authorization': 'Bearer ' + token}
+
+
 CHAT_OPERATIONS = sorted(set(re.findall(r'\bchat\.(\w+)', Path('chat_http.py').read_text())))
 
 
@@ -90,29 +94,49 @@ class ChatHttpTests(unittest.IsolatedAsyncioTestCase):
         self.chat.edit_message_in_room.return_value = 1
         self.chat.delete_message_in_room.return_value = True
         self.chat.create_or_update_room.return_value = (5, 'group', None)
-        app = create_chat_app(self.pool, 'test-secret', logging.getLogger('test-chat'), self.chat)
+        app = create_chat_app(self.pool, logging.getLogger('test-chat'), self.chat)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def get(self, path, secret='test-secret', **params):
+    async def get(self, path, user_token='user-token', **params):
         query = {'username': 'george', 'organization_id': '1', **params}
         query = {key: value for key, value in query.items() if value is not None}
-        return await self.client.get(path, params=query, headers={'Authorization': 'Bearer ' + secret})
+        return await self.client.get(path, params=query, headers=AUTH(user_token))
 
-    async def post(self, path, body=None, secret='test-secret'):
+    async def post(self, path, body=None, user_token='user-token'):
         body = {'username': 'george', 'organization_id': 1, **(body or {})}
-        return await self.client.post(path, json=body, headers={'Authorization': 'Bearer ' + secret})
+        return await self.client.post(path, json=body, headers=AUTH(user_token))
 
-    async def test_authentication_before_database_access(self):
-        response = await self.get('/chat/unread', secret='incorrect')
+    async def test_missing_token_is_rejected_before_database_access(self):
+        response = await self.client.get('/chat/unread', params={'username': 'george', 'organization_id': '1'})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(await response.json(), {'error': 'missing_token'})
+        response = await self.client.get('/chat/unread', params={'username': 'george', 'organization_id': '1'},
+                                         headers={'Authorization': 'Basic user-token'})
         self.assertEqual(response.status, 401)
         self.assertEqual(self.pool.queries, [])
 
+    async def test_wrong_token_is_rejected(self):
+        response = await self.post('/chat/rooms/1/messages', {'message': 'hi'}, user_token='other-token')
+        self.assertEqual(response.status, 401)
+        self.assertEqual(await response.json(), {'error': 'invalid_credentials'})
+        self.chat.store_new_message.assert_not_called()
+
+    async def test_user_without_a_token_cannot_be_used(self):
+        self.pool.user = {'id': 7, 'username': 'george', 'token': None}
+        self.assertEqual((await self.get('/chat/unread')).status, 401)
+        self.pool.user = {'id': 7, 'username': 'george', 'token': ''}
+        self.assertEqual((await self.get('/chat/unread')).status, 401)
+
+    async def test_nginx_query_token_is_ignored(self):
+        response = await self.get('/chat/unread', token='J/x+y=')
+        self.assertEqual(response.status, 200)
+
     async def test_post_is_not_allowed(self):
-        response = await self.client.post('/chat/unread', headers={'Authorization': 'Bearer test-secret'})
+        response = await self.client.post('/chat/unread', headers=AUTH('user-token'))
         self.assertEqual(response.status, 405)
 
     async def test_invalid_organization_and_username(self):
@@ -121,11 +145,11 @@ class ChatHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.get('/chat/unread', username=' ')).status, 400)
         self.assertEqual(self.pool.queries, [])
 
-    async def test_unknown_user(self):
+    async def test_unknown_user_looks_like_a_wrong_token(self):
         self.pool.user = None
         response = await self.get('/chat/unread')
-        self.assertEqual(response.status, 404)
-        self.assertEqual(await response.json(), {'error': 'user_not_found'})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(await response.json(), {'error': 'invalid_credentials'})
 
     async def test_unread_summary(self):
         response = await self.get('/chat/unread')
@@ -195,16 +219,12 @@ class ChatHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 500)
         self.assertEqual(await response.json(), {'error': 'request_failed'})
 
-    async def test_post_authentication_and_body_validation(self):
-        response = await self.post('/chat/rooms/1/messages', {'message': 'hi'}, secret='incorrect')
-        self.assertEqual(response.status, 401)
-        self.chat.store_new_message.assert_not_called()
-        response = await self.client.post('/chat/rooms', data='not json',
-                                          headers={'Authorization': 'Bearer test-secret'})
+    async def test_post_body_validation(self):
+        response = await self.client.post('/chat/rooms', data='not json', headers=AUTH('user-token'))
         self.assertEqual(response.status, 400)
-        response = await self.client.post('/chat/rooms', json=[1],
-                                          headers={'Authorization': 'Bearer test-secret'})
+        response = await self.client.post('/chat/rooms', json=[1], headers=AUTH('user-token'))
         self.assertEqual(await response.json(), {'error': 'expected_json_object'})
+        self.chat.create_or_update_room.assert_not_called()
 
     async def test_room_endpoints_require_participation(self):
         self.pool.participant = None
