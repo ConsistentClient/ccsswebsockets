@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import json
 import time
+import uuid
 
 import aiomysql
 from aiohttp import web
@@ -84,13 +85,14 @@ class CallNotificationDispatcher:
             cached = self.completed.get(key)
             delivered = cached[2] if cached else set()
             counts = {"accepted": 0, "unregistered": 0, "failed": 0}
-            pending = []
+            # Each device entry also says how the app wants calls delivered (see send_push).
+            pending = {}
             for entry in tokens:
                 token = entry.get("token") if isinstance(entry, dict) else None
                 if not isinstance(token, str) or not token.strip():
                     counts["failed"] += 1
                 elif token not in delivered and token not in pending:
-                    pending.append(token)
+                    pending[token] = entry
             if cached and not pending:
                 return 200, dict(cached[1], duplicate=True)
 
@@ -99,19 +101,25 @@ class CallNotificationDispatcher:
                 "type": "incoming_call", "action": "open_calls", "call_id": call_id,
                 "caller": caller, "caller_name": values["caller_name"],
                 "caller_number": values["caller_number"], "extension": values["extension"],
+                # One UUID per call, so CallKit and the Android call screen show a repeated push as one call.
+                "callkit_id": str(uuid.uuid5(uuid.NAMESPACE_URL, "ccss-call:" + call_id)),
             }
             # Always push for PBX alerts, including users with an active WebSocket.
             # Devices are sent concurrently so one slow token does not delay the rest.
             statuses = await asyncio.gather(*(
-                asyncio.to_thread(self.send_push, token, "Incoming call", caller, data, user_id, organization_id)
-                for token in pending
+                asyncio.to_thread(self.send_push, token, "Incoming call", caller, data, user_id, organization_id,
+                                  device=entry)
+                for token, entry in pending.items()
             ))
             accepted = set()
             unregistered = set()
+            voip_gone = set()
             for token, status in zip(pending, statuses):
-                if status == "ok":
+                if status in ("ok", "voip_unregistered"):
                     counts["accepted"] += 1
                     accepted.add(token)
+                    if status == "voip_unregistered":
+                        voip_gone.add(token)
                 elif status == "unregistered":
                     counts["unregistered"] += 1
                     unregistered.add(token)
@@ -121,8 +129,8 @@ class CallNotificationDispatcher:
                 "PBX push result: user_id=%s organization_id=%s call_id=%s accepted=%s unregistered=%s failed=%s",
                 user_id, organization_id, call_id, counts["accepted"], counts["unregistered"], counts["failed"],
             )
-            if unregistered:
-                await self.remove_tokens(tokens, unregistered, user_id, organization_id)
+            if unregistered or voip_gone:
+                await self.remove_tokens(tokens, unregistered, user_id, organization_id, voip_gone)
             response = dict(counts, call_id=call_id, status="accepted" if counts["accepted"] else "failed")
             if counts["accepted"]:
                 # Bounded process-local deduplication; not a durable delivery receipt.
@@ -139,12 +147,20 @@ class CallNotificationDispatcher:
             if key is not None:
                 self.in_progress.discard(key)
 
-    async def remove_tokens(self, tokens, invalid_tokens, user_id, organization_id):
+    async def remove_tokens(self, tokens, invalid_tokens, user_id, organization_id, voip_gone=()):
+        """Removes devices Firebase no longer knows, and VoIP tokens APNs refused from devices that remain."""
         self.logger.warning(
-            "Removing unregistered device tokens: user_id=%s organization_id=%s count=%s",
-            user_id, organization_id, len(invalid_tokens),
+            "Removing unregistered device tokens: user_id=%s organization_id=%s count=%s voip_count=%s",
+            user_id, organization_id, len(invalid_tokens), len(voip_gone),
         )
-        remaining = [t for t in tokens if not isinstance(t, dict) or t.get("token") not in invalid_tokens]
+        remaining = []
+        for entry in tokens:
+            if isinstance(entry, dict) and entry.get("token") in invalid_tokens:
+                continue
+            if isinstance(entry, dict) and entry.get("token") in voip_gone:
+                # The device keeps its ordinary alerts until the app registers a new VoIP token.
+                entry = {key: value for key, value in entry.items() if key != "voip_token"}
+            remaining.append(entry)
         try:
             async with self.pool.acquire() as conn:
                 async with conn.cursor() as cursor:

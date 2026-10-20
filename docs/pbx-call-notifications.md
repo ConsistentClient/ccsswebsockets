@@ -4,7 +4,7 @@
 
 The PBX authenticates the shared account using `Register`, then sends `event=call_notification` with the separate recipient username/organization. `ccsswebsockets` reads the recipient's device tokens from `clients` and sends Firebase `data.type=incoming_call`. Only organization 0 senders (the shared notification account) can send call events, and they can target any tenant; other accounts are rejected with `recipient_not_authorized`. Every call event requires its registration session token.
 
-This sends ordinary call alerts. RFC 8599 SIP registration wake-up and iOS PushKit/CallKit require further integration.
+Calls reach iPhones as VoIP (PushKit) pushes shown in CallKit and Android phones as full-screen calls, when the installed app supports it; see [How calls reach each phone](#how-calls-reach-each-phone).
 
 ## Deploy and initialize
 
@@ -72,17 +72,23 @@ Use the returned session token in the call request:
 
 Success returns `event=call_notification_success`, `status=accepted`, and `accepted>0`. Firebase acceptance does not confirm phone display. Failures return `call_notification_failed` with an error or device counts. Call events are processed concurrently, so replies can arrive out of order; every reply carries the request's `call_id`. `organization_id` may be a number or a numeric string, and null caller fields are treated as empty. Logs include call/recipient identifiers and counts, without passwords or full device tokens.
 
-Call pushes are sent even when recipients have active WebSockets. Android uses high priority with a 30-second TTL; APNs uses an ordinary alert with a 30-second expiry and default sound.
+Call pushes are sent even when recipients have active WebSockets. Android uses high priority with a 30-second TTL; APNs pushes (alert or VoIP) expire after 30 seconds.
 
-### Android data-only call pushes
+### How calls reach each phone
 
-By default the Android message carries a `notification` block, so when the app is in the background Android shows it as an ordinary notification and the app's code does not run until it is tapped. Setting this in `config.py` (and restarting) sends `incoming_call` to Android as a data-only, high-priority message instead:
+Each device entry in `clients.device_token` carries what the app said about the device when it registered its token (`POST /api/storeToken` in dev_ccss): `platform`, `call_push`, and on iPhone `voip_token`, `bundle_id` and `team_id`. Every registration replaces them, so a device always gets what its installed app version handles:
 
-```python
-CALL_PUSH_ANDROID_DATA_ONLY = True
-```
+| Device | Call push |
+| --- | --- |
+| iPhone with a `voip_token` | VoIP (PushKit) push sent straight to APNs: wakes the app, which shows the call in CallKit. If it cannot be sent, the ordinary alert below is sent instead. |
+| Android with `call_push` | Data-only, high-priority FCM message: the app shows a full-screen incoming call, also from the background. |
+| Anything else (older app versions) | The ordinary alert, as before. |
 
-Then `onMessageReceived` runs for every call push, in the foreground and the background, with `data` holding `type=incoming_call`, `action`, `call_id`, `caller`, `caller_name`, `caller_number`, `extension`, `title` and `body` (all strings). The app must show the call itself, for example a full-screen incoming-call notification or a `ConnectionService` call, and register with the PBX. An app version that does not handle it shows nothing, so enable the setting only once every Android user has such a version. iOS is unaffected: the same alert, title and sound are set on the APNs payload. Other notification types are unchanged. A Firebase message cannot start the app after the user force-stopped it, which no Android push can. Accepted calls are deduplicated for 60 seconds per recipient/call ID within a Python process, across both the WebSocket and HTTP paths, without persistence across restarts or coordination across processes. Deduplication is per device: repeating a call ID resends only to devices that did not accept it. Tokens Firebase reports as unregistered are removed from `clients.device_token`.
+The call data (all strings) is `type=incoming_call`, `action`, `call_id`, `callkit_id` (one UUID per call, so a repeated push shows as one call), `caller`, `caller_name`, `caller_number`, `extension`, `title` and `body`. Chat and other notifications are unchanged.
+
+VoIP pushes are signed with the Apple push key: download it in the Apple Developer account (Keys, with Apple Push Notifications service enabled) and put it, under the name Apple gives it (`AuthKey_<KEY_ID>.p8`), next to `main.py`, then restart. The key ID comes from the file name and the team and bundle IDs from the app, so nothing else is configured; production and sandbox (development build) tokens are both handled. APNs needs HTTP/2: `pip install "httpx[http2]"` in the service's environment. Without the key file or the package, iPhones get the ordinary alert and the reason is logged. A VoIP token APNs rejects as no longer valid is removed from the device entry, which then gets ordinary alerts until the app registers a new one.
+
+The PBX holds the ring of an unregistered app extension for up to 20 seconds while the woken app registers (see fusionapi's ring hook). A push cannot start an Android app the user force-stopped.
 
 ## Organization isolation
 

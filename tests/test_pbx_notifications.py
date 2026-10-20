@@ -127,7 +127,7 @@ class PbxNotificationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_retry_reaches_only_devices_that_failed(self):
         self.tokens.return_value = [{'token': 'device-a'}, {'token': 'device-b'}]
-        self.send.side_effect = lambda token, *args: 'ok' if token == 'device-a' else 'error'
+        self.send.side_effect = lambda token, *args, **kwargs: 'ok' if token == 'device-a' else 'error'
         result = await (await self.post()).json()
         self.assertEqual((result['accepted'], result['failed']), (1, 1))
         self.send.side_effect = None
@@ -168,7 +168,7 @@ class PbxNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_devices_and_malformed_entries(self):
         self.tokens.return_value = [None, {}, {'token': ''}, {'token': 'device-a'},
                                     {'token': 'device-a'}, {'token': 'device-b'}]
-        self.send.side_effect = lambda token, *args: 'ok' if token == 'device-a' else 'unregistered'
+        self.send.side_effect = lambda token, *args, **kwargs: 'ok' if token == 'device-a' else 'unregistered'
         result = await (await self.post()).json()
         self.assertEqual((result['accepted'], result['unregistered'], result['failed']), (1, 1, 3))
         self.assertEqual(self.send.call_count, 2)
@@ -178,13 +178,29 @@ class PbxNotificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(params[0]), [None, {}, {'token': ''}, {'token': 'device-a'}, {'token': 'device-a'}])
         self.assertEqual(params[1:], (2, 1))
 
+    async def test_each_device_entry_reaches_the_sender_and_a_refused_voip_token_is_dropped(self):
+        ios = {'token': 'device-a', 'platform': 'ios', 'voip_token': 'voip-a', 'bundle_id': 'com.test', 'team_id': 'TEAM'}
+        android = {'token': 'device-b', 'platform': 'android', 'call_push': True}
+        self.tokens.return_value = [ios, android]
+        self.send.side_effect = lambda token, *args, **kwargs: 'voip_unregistered' if token == 'device-a' else 'ok'
+        result = await (await self.post()).json()
+        self.assertEqual((result['accepted'], result['unregistered'], result['failed']), (2, 0, 0))
+        self.assertEqual([call.kwargs['device'] for call in self.send.call_args_list], [ios, android])
+        data = self.send.call_args.args[3]
+        # The same call always gets the same CallKit UUID.
+        self.assertEqual(data['callkit_id'], '%s' % __import__('uuid').uuid5(__import__('uuid').NAMESPACE_URL, 'ccss-call:call-123'))
+        # The device keeps its FCM token and everything else; only the VoIP token goes.
+        query, params = self.pool.queries[-1]
+        self.assertIn('UPDATE clients SET device_token', query)
+        self.assertEqual(json.loads(params[0]), [{k: v for k, v in ios.items() if k != 'voip_token'}, android])
+
     async def test_database_exception_and_concurrent_duplicate(self):
         self.pool.failure = True
         self.assertEqual((await self.post()).status, 500)
         self.pool.failure = False
         started = asyncio.Event()
         release = asyncio.Event()
-        async def blocked_send(*args):
+        async def blocked_send(*args, **kwargs):
             started.set()
             await release.wait()
             return 'ok'
@@ -279,49 +295,130 @@ class RoomParticipantTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FirebaseCallPayloadTests(unittest.TestCase):
-    def test_call_options_encode_with_real_sdk(self):
+    def setUp(self):
         import hashlib
         from datetime import datetime, timedelta
         from firebase_admin import exceptions, messaging
+        self.messaging = messaging
         tree = ast.parse(Path('main.py').read_text())
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name in {'device_token_fingerprint', 'send_push_notification'}]
-        namespace = dict(hashlib=hashlib, datetime=datetime, timedelta=timedelta,
-                         json=json, messaging=messaging, exceptions=exceptions, config=SimpleNamespace(),
-                         notification_logger=logging.getLogger('test-fcm'),
-                         firebase_admin=SimpleNamespace(get_app=lambda: SimpleNamespace(project_id='test')))
-        exec(compile(ast.Module(body=funcs, type_ignores=[]), 'main.py', 'exec'), namespace)
-        with patch.object(messaging, 'send', return_value='test-message') as send:
-            self.assertEqual(namespace['send_push_notification']('token', 'Title', 'Body', {'type': 'incoming_call'}), 'ok')
-            encoded = json.loads(str(send.call_args.args[0]))
-            self.assertEqual(encoded['android']['priority'], 'high')
-            self.assertEqual(encoded['android']['ttl'], '30s')
-            self.assertEqual(encoded['apns']['headers']['apns-push-type'], 'alert')
-            self.assertEqual(encoded['apns']['payload']['aps']['sound'], 'default')
-            self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
-            self.assertNotIn('alert', encoded['apns']['payload']['aps'])
-            namespace['send_push_notification']('token', 'Title', 'Body', {'type': 'notification'})
-            encoded = json.loads(str(send.call_args.args[0]))
-            self.assertNotIn('android', encoded)
-            self.assertNotIn('apns', encoded)
+        self.voip = Mock()
+        self.namespace = dict(hashlib=hashlib, datetime=datetime, timedelta=timedelta,
+                              json=json, messaging=messaging, exceptions=exceptions, apns_voip=self.voip,
+                              notification_logger=logging.getLogger('test-fcm'),
+                              firebase_admin=SimpleNamespace(get_app=lambda: SimpleNamespace(project_id='test')))
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), 'main.py', 'exec'), self.namespace)
 
-            # Data-only for Android, while iOS keeps its alert on the APNs payload.
-            namespace['config'].CALL_PUSH_ANDROID_DATA_ONLY = True
-            self.assertEqual(namespace['send_push_notification'](
-                'token', 'Title', 'Body', {'type': 'incoming_call', 'call_id': 'c1'}), 'ok')
-            encoded = json.loads(str(send.call_args.args[0]))
-            self.assertNotIn('notification', encoded)
-            self.assertEqual(encoded['data'], {'type': 'incoming_call', 'call_id': 'c1', 'title': 'Title', 'body': 'Body'})
+    def push(self, data, device=None):
+        with patch.object(self.messaging, 'send', return_value='test-message') as send:
+            status = self.namespace['send_push_notification']('token', 'Title', 'Body', data, 2, 1, device=device)
+        return status, (json.loads(str(send.call_args.args[0])) if send.called else None)
+
+    def test_call_to_a_device_that_did_not_say_what_it_supports_is_an_ordinary_alert(self):
+        for device in (None, {'token': 'token'}, {'token': 'token', 'platform': 'android'}):
+            status, encoded = self.push({'type': 'incoming_call'}, device)
+            self.assertEqual(status, 'ok')
+            self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
             self.assertEqual(encoded['android']['priority'], 'high')
             self.assertEqual(encoded['android']['ttl'], '30s')
-            self.assertEqual(encoded['apns']['payload']['aps']['alert'], {'title': 'Title', 'body': 'Body'})
-            self.assertEqual(encoded['apns']['payload']['aps']['sound'], 'default')
             self.assertEqual(encoded['apns']['headers']['apns-push-type'], 'alert')
-            # Other notifications are unchanged by the setting.
-            namespace['send_push_notification']('token', 'Title', 'Body', {'type': 'notification'})
-            encoded = json.loads(str(send.call_args.args[0]))
+            self.assertEqual(encoded['apns']['payload']['aps']['sound'], 'default')
+        self.voip.send.assert_not_called()
+        status, encoded = self.push({'type': 'notification'})
+        self.assertNotIn('android', encoded)
+        self.assertNotIn('apns', encoded)
+
+    def test_android_app_that_handles_calls_gets_them_data_only(self):
+        device = {'token': 'token', 'platform': 'android', 'call_push': True}
+        status, encoded = self.push({'type': 'incoming_call', 'call_id': 'c1'}, device)
+        self.assertEqual(status, 'ok')
+        self.assertNotIn('notification', encoded)
+        self.assertEqual(encoded['data'], {'type': 'incoming_call', 'call_id': 'c1', 'title': 'Title', 'body': 'Body'})
+        self.assertEqual(encoded['android']['priority'], 'high')
+        self.assertEqual(encoded['android']['ttl'], '30s')
+        # Chat and other notifications stay ordinary alerts.
+        status, encoded = self.push({'type': 'notification'}, device)
+        self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
+
+    def test_iphone_with_a_voip_token_gets_a_voip_push_and_falls_back_to_the_alert(self):
+        device = {'token': 'token', 'platform': 'ios', 'voip_token': 'voip', 'bundle_id': 'com.test', 'team_id': 'TEAM'}
+        self.voip.send.return_value = 'ok'
+        status, encoded = self.push({'type': 'incoming_call', 'call_id': 'c1'}, device)
+        self.assertEqual((status, encoded), ('ok', None))
+        self.voip.send.assert_called_once_with('voip', 'com.test', 'TEAM',
+                                               {'type': 'incoming_call', 'call_id': 'c1', 'title': 'Title', 'body': 'Body'})
+        # Not set up, failed, or a dead VoIP token: the user still gets the ordinary alert.
+        for voip_status, expected in ((None, 'ok'), ('error', 'ok'), ('unregistered', 'voip_unregistered')):
+            self.voip.send.return_value = voip_status
+            status, encoded = self.push({'type': 'incoming_call'}, device)
+            self.assertEqual(status, expected)
             self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
-            self.assertNotIn('android', encoded)
+            self.assertEqual(encoded['apns']['headers']['apns-push-type'], 'alert')
+        # A chat message to the same iPhone is not a VoIP push.
+        self.voip.send.reset_mock()
+        self.push({'type': 'notification'}, device)
+        self.voip.send.assert_not_called()
+
+
+class ApnsVoipTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import ec
+        self.directory = tempfile.TemporaryDirectory()
+        key = ec.generate_private_key(ec.SECP256R1())
+        self.public_key = key.public_key()
+        Path(self.directory.name, 'AuthKey_KEY123.p8').write_bytes(key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        self.requests = []
+        self.replies = []
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def sender(self, directory=None):
+        import httpx
+        from apns_voip import ApnsVoip
+
+        def handler(request):
+            self.requests.append(request)
+            status, reason = self.replies.pop(0)
+            return httpx.Response(status, json={'reason': reason} if reason else None)
+        return ApnsVoip(directory or self.directory.name, logging.getLogger('test-apns'),
+                        client_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    def test_signed_voip_push_and_sandbox_fallback(self):
+        import jwt
+        sender = self.sender()
+        self.replies = [(400, 'BadDeviceToken'), (200, None), (200, None)]
+        self.assertEqual(sender.send('abc', 'com.test', 'TEAM', {'type': 'incoming_call'}), 'ok')
+        first, second = self.requests
+        self.assertEqual(str(first.url), 'https://api.push.apple.com/3/device/abc')
+        self.assertEqual(str(second.url), 'https://api.sandbox.push.apple.com/3/device/abc')
+        self.assertEqual(second.headers['apns-push-type'], 'voip')
+        self.assertEqual(second.headers['apns-topic'], 'com.test.voip')
+        self.assertEqual(second.headers['apns-priority'], '10')
+        self.assertEqual(json.loads(second.content), {'type': 'incoming_call', 'aps': {}})
+        token = second.headers['authorization'][len('bearer '):]
+        self.assertEqual(jwt.get_unverified_header(token)['kid'], 'KEY123')
+        self.assertEqual(jwt.decode(token, self.public_key, algorithms=['ES256'])['iss'], 'TEAM')
+        # The environment that accepted the token is used straight away next time.
+        self.assertEqual(sender.send('abc', 'com.test', 'TEAM', {}), 'ok')
+        self.assertEqual(str(self.requests[2].url), 'https://api.sandbox.push.apple.com/3/device/abc')
+
+    def test_dead_token_other_refusal_and_missing_key(self):
+        import tempfile
+        sender = self.sender()
+        self.replies = [(400, 'BadDeviceToken'), (400, 'BadDeviceToken'), (410, 'Unregistered'), (403, 'InvalidProviderToken')]
+        self.assertEqual(sender.send('abc', 'com.test', 'TEAM', {}), 'unregistered')
+        self.assertEqual(sender.send('def', 'com.test', 'TEAM', {}), 'unregistered')
+        self.assertEqual(sender.send('ghi', 'com.test', 'TEAM', {}), 'error')
+        # Without the key file, or without what the app reports, nothing is sent.
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertIsNone(self.sender(empty).send('abc', 'com.test', 'TEAM', {}))
+        self.assertIsNone(sender.send('abc', 'com.test', '', {}))
+        self.assertEqual(len(self.requests), 4)
 
 
 if __name__ == '__main__':

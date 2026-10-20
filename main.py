@@ -18,6 +18,7 @@ from firebase_admin import credentials, messaging
 from firebase_admin import exceptions  
 from pbx_notifications import CallNotificationDispatcher, create_pbx_app
 from chat_http import create_chat_app
+from apns_voip import ApnsVoip
 
 # config file local
 import config
@@ -38,6 +39,9 @@ if not notification_logger.handlers:
         "%(asctime)s %(levelname)s [firebase_notifications] %(message)s"
     ))
     notification_logger.addHandler(notification_handler)
+
+# The Apple push key (AuthKey_<KEY_ID>.p8) is looked for next to this file.
+apns_voip = ApnsVoip(os.path.dirname(os.path.abspath(__file__)), notification_logger)
 
 
 def device_token_fingerprint(token):
@@ -1532,47 +1536,60 @@ async def ws_handler( websocket ):
     finally:
         connected_clients.pop(websocket, None)
 
-def send_push_notification(token, title, body, data=None, user_id=None, organization_id=None):
+def send_push_notification(token, title, body, data=None, user_id=None, organization_id=None, device=None):
     """
-    Sends a push notification to a specific device via FCM.
+    Sends a push notification to a specific device via FCM, or for a call to an iPhone that registered
+    a VoIP token, a PushKit push via APNs.
     :param token: The FCM device registration token.
     :param title: Notification title.
     :param body: Notification body.
     :param data: Optional custom key/value payload (dict).
+    :param device: The device's clients.device_token entry: what the app said it supports.
+    Returns "ok", "unregistered", "error", or "voip_unregistered" when the alert reached the device
+    but its VoIP token will not work again.
     """
     context = "user_id=%s organization_id=%s token_fingerprint=%s"
     context_args = (user_id, organization_id, device_token_fingerprint(token))
+    device = device if isinstance(device, dict) else {}
+    is_call = (data or {}).get("type") == "incoming_call"
+    voip_gone = False
+    if is_call and device.get("platform") == "ios" and isinstance(device.get("voip_token"), str):
+        # PushKit wakes the app, which shows the call in CallKit. When that cannot be sent, the
+        # ordinary alert below still tells the user about the call.
+        status = apns_voip.send(device["voip_token"], device.get("bundle_id"), device.get("team_id"),
+                                dict(data, title=title or "", body=body or ""))
+        notification_logger.info("APNs VoIP push: " + context + " status=%s", *context_args, status)
+        if status == "ok":
+            return "ok"
+        voip_gone = status == "unregistered"
+    # Android apps that handle calls themselves get them data-only: their message handler then runs in
+    # the background too and shows a full-screen call, instead of Android showing a plain notification.
+    data_only = is_call and device.get("platform") == "android" and device.get("call_push") is True
+    if data_only:
+        data = dict(data, title=title or "", body=body or "")
     try:
         app = firebase_admin.get_app()
         notification_logger.info(
-            "FCM send attempt: " + context + " project_id=%s type=%s title_present=%s body_present=%s data_bytes=%s",
-            *context_args, app.project_id, (data or {}).get("type"), bool(title), bool(body),
+            "FCM send attempt: " + context + " project_id=%s type=%s data_only=%s title_present=%s body_present=%s data_bytes=%s",
+            *context_args, app.project_id, (data or {}).get("type"), data_only, bool(title), bool(body),
             len(json.dumps(data or {}).encode()),
         )
-        is_call = (data or {}).get("type") == "incoming_call"
-        # Android data-only: the app's onMessageReceived runs even in the background and shows its own
-        # incoming-call screen. Off by default, because an app that does not handle it shows nothing.
-        data_only = is_call and bool(getattr(config, "CALL_PUSH_ANDROID_DATA_ONLY", False))
-        if data_only:
-            data = dict(data, title=title or "", body=body or "")
         message = messaging.Message(
             notification=None if data_only else messaging.Notification(title=title, body=body),
             token=token,
             data=data or {},
         )
         if is_call:
-            # A short-lived ordinary alert on iOS, not a PushKit VoIP push. Tokens carry no platform, so
-            # the iOS alert stays on the APNs payload when the Android message is data-only.
-            aps = messaging.Aps(sound="default", alert=messaging.ApsAlert(title=title, body=body) if data_only else None)
+            # A short-lived alert: a call that rang out is not worth showing.
             message.android = messaging.AndroidConfig(priority="high", ttl=timedelta(seconds=30))
             message.apns = messaging.APNSConfig(
                 headers={"apns-push-type": "alert", "apns-priority": "10",
                          "apns-expiration": str(int(datetime.now().timestamp()) + 30)},
-                payload=messaging.APNSPayload(aps=aps),
+                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
             )
         response = messaging.send(message)
         notification_logger.info("FCM accepted (device display not confirmed): " + context + " message_id=%s", *context_args, response)
-        return "ok"
+        return "voip_unregistered" if voip_gone else "ok"
     except messaging.UnregisteredError as e:
         notification_logger.exception("FCM token unregistered: " + context + " code=%s", *context_args, getattr(e, "code", None))
         return "unregistered"
