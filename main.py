@@ -1549,18 +1549,26 @@ def send_push_notification(token, title, body, data=None, user_id=None, organiza
             *context_args, app.project_id, (data or {}).get("type"), bool(title), bool(body),
             len(json.dumps(data or {}).encode()),
         )
+        is_call = (data or {}).get("type") == "incoming_call"
+        # Android data-only: the app's onMessageReceived runs even in the background and shows its own
+        # incoming-call screen. Off by default, because an app that does not handle it shows nothing.
+        data_only = is_call and bool(getattr(config, "CALL_PUSH_ANDROID_DATA_ONLY", False))
+        if data_only:
+            data = dict(data, title=title or "", body=body or "")
         message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
+            notification=None if data_only else messaging.Notification(title=title, body=body),
             token=token,
             data=data or {},
         )
-        if (data or {}).get("type") == "incoming_call":
-            # A short-lived ordinary alert, not a PushKit VoIP push.
+        if is_call:
+            # A short-lived ordinary alert on iOS, not a PushKit VoIP push. Tokens carry no platform, so
+            # the iOS alert stays on the APNs payload when the Android message is data-only.
+            aps = messaging.Aps(sound="default", alert=messaging.ApsAlert(title=title, body=body) if data_only else None)
             message.android = messaging.AndroidConfig(priority="high", ttl=timedelta(seconds=30))
             message.apns = messaging.APNSConfig(
                 headers={"apns-push-type": "alert", "apns-priority": "10",
                          "apns-expiration": str(int(datetime.now().timestamp()) + 30)},
-                payload=messaging.APNSPayload(aps=messaging.Aps(sound="default")),
+                payload=messaging.APNSPayload(aps=aps),
             )
         response = messaging.send(message)
         notification_logger.info("FCM accepted (device display not confirmed): " + context + " message_id=%s", *context_args, response)

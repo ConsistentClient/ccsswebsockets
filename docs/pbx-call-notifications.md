@@ -4,7 +4,7 @@
 
 The PBX authenticates the shared account using `Register`, then sends `event=call_notification` with the separate recipient username/organization. `ccsswebsockets` reads the recipient's device tokens from `clients` and sends Firebase `data.type=incoming_call`. Only organization 0 senders (the shared notification account) can send call events, and they can target any tenant; other accounts are rejected with `recipient_not_authorized`. Every call event requires its registration session token.
 
-This sends ordinary call alerts. RFC 8599 SIP registration wake-up and iOS PushKit/CallKit require further integration. The existing invalid APNs credential must be corrected for iPhone delivery.
+This sends ordinary call alerts. RFC 8599 SIP registration wake-up and iOS PushKit/CallKit require further integration.
 
 ## Deploy and initialize
 
@@ -72,7 +72,17 @@ Use the returned session token in the call request:
 
 Success returns `event=call_notification_success`, `status=accepted`, and `accepted>0`. Firebase acceptance does not confirm phone display. Failures return `call_notification_failed` with an error or device counts. Call events are processed concurrently, so replies can arrive out of order; every reply carries the request's `call_id`. `organization_id` may be a number or a numeric string, and null caller fields are treated as empty. Logs include call/recipient identifiers and counts, without passwords or full device tokens.
 
-Call pushes are sent even when recipients have active WebSockets. Android uses high priority with a 30-second TTL; APNs uses an ordinary alert with a 30-second expiry and default sound. Accepted calls are deduplicated for 60 seconds per recipient/call ID within a Python process, across both the WebSocket and HTTP paths, without persistence across restarts or coordination across processes. Deduplication is per device: repeating a call ID resends only to devices that did not accept it. Tokens Firebase reports as unregistered are removed from `clients.device_token`.
+Call pushes are sent even when recipients have active WebSockets. Android uses high priority with a 30-second TTL; APNs uses an ordinary alert with a 30-second expiry and default sound.
+
+### Android data-only call pushes
+
+By default the Android message carries a `notification` block, so when the app is in the background Android shows it as an ordinary notification and the app's code does not run until it is tapped. Setting this in `config.py` (and restarting) sends `incoming_call` to Android as a data-only, high-priority message instead:
+
+```python
+CALL_PUSH_ANDROID_DATA_ONLY = True
+```
+
+Then `onMessageReceived` runs for every call push, in the foreground and the background, with `data` holding `type=incoming_call`, `action`, `call_id`, `caller`, `caller_name`, `caller_number`, `extension`, `title` and `body` (all strings). The app must show the call itself, for example a full-screen incoming-call notification or a `ConnectionService` call, and register with the PBX. An app version that does not handle it shows nothing, so enable the setting only once every Android user has such a version. iOS is unaffected: the same alert, title and sound are set on the APNs payload. Other notification types are unchanged. A Firebase message cannot start the app after the user force-stopped it, which no Android push can. Accepted calls are deduplicated for 60 seconds per recipient/call ID within a Python process, across both the WebSocket and HTTP paths, without persistence across restarts or coordination across processes. Deduplication is per device: repeating a call ID resends only to devices that did not accept it. Tokens Firebase reports as unregistered are removed from `clients.device_token`.
 
 ## Organization isolation
 

@@ -287,7 +287,7 @@ class FirebaseCallPayloadTests(unittest.TestCase):
         funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef)
                  and n.name in {'device_token_fingerprint', 'send_push_notification'}]
         namespace = dict(hashlib=hashlib, datetime=datetime, timedelta=timedelta,
-                         json=json, messaging=messaging, exceptions=exceptions,
+                         json=json, messaging=messaging, exceptions=exceptions, config=SimpleNamespace(),
                          notification_logger=logging.getLogger('test-fcm'),
                          firebase_admin=SimpleNamespace(get_app=lambda: SimpleNamespace(project_id='test')))
         exec(compile(ast.Module(body=funcs, type_ignores=[]), 'main.py', 'exec'), namespace)
@@ -298,10 +298,30 @@ class FirebaseCallPayloadTests(unittest.TestCase):
             self.assertEqual(encoded['android']['ttl'], '30s')
             self.assertEqual(encoded['apns']['headers']['apns-push-type'], 'alert')
             self.assertEqual(encoded['apns']['payload']['aps']['sound'], 'default')
+            self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
+            self.assertNotIn('alert', encoded['apns']['payload']['aps'])
             namespace['send_push_notification']('token', 'Title', 'Body', {'type': 'notification'})
             encoded = json.loads(str(send.call_args.args[0]))
             self.assertNotIn('android', encoded)
             self.assertNotIn('apns', encoded)
+
+            # Data-only for Android, while iOS keeps its alert on the APNs payload.
+            namespace['config'].CALL_PUSH_ANDROID_DATA_ONLY = True
+            self.assertEqual(namespace['send_push_notification'](
+                'token', 'Title', 'Body', {'type': 'incoming_call', 'call_id': 'c1'}), 'ok')
+            encoded = json.loads(str(send.call_args.args[0]))
+            self.assertNotIn('notification', encoded)
+            self.assertEqual(encoded['data'], {'type': 'incoming_call', 'call_id': 'c1', 'title': 'Title', 'body': 'Body'})
+            self.assertEqual(encoded['android']['priority'], 'high')
+            self.assertEqual(encoded['android']['ttl'], '30s')
+            self.assertEqual(encoded['apns']['payload']['aps']['alert'], {'title': 'Title', 'body': 'Body'})
+            self.assertEqual(encoded['apns']['payload']['aps']['sound'], 'default')
+            self.assertEqual(encoded['apns']['headers']['apns-push-type'], 'alert')
+            # Other notifications are unchanged by the setting.
+            namespace['send_push_notification']('token', 'Title', 'Body', {'type': 'notification'})
+            encoded = json.loads(str(send.call_args.args[0]))
+            self.assertEqual(encoded['notification'], {'title': 'Title', 'body': 'Body'})
+            self.assertNotIn('android', encoded)
 
 
 if __name__ == '__main__':
