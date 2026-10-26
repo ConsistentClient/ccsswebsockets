@@ -11,6 +11,7 @@ import mysql.connector
 import aiomysql
 from functools import partial
 import secrets
+import time
 from types import SimpleNamespace
 from datetime import datetime, timedelta
 import firebase_admin
@@ -995,8 +996,18 @@ async def ws_handler( websocket ):
                         username = theMessageContent.get("username")
                         token = theMessageContent.get("token")
                         print(f"{client_ip}: user_id '{username}'")
-                        user = await check_user(username, token)
+                        # Only a fingerprint of the token is logged, never the token itself.
+                        print(f"{client_ip}: token present={bool(token)} fingerprint={device_token_fingerprint(token)}")
+                        print(f"{client_ip}: Checking user in database...")
+                        started = time.monotonic()
+                        try:
+                            user = await check_user(username, token)
+                        except Exception as err:
+                            print(f"{client_ip}: check_user failed after {time.monotonic() - started:.2f}s: {err!r}")
+                            raise
+                        print(f"{client_ip}: check_user finished in {time.monotonic() - started:.2f}s found={user is not None}")
                         if user == None :
+                            print(f"{client_ip}: Register failed for '{username}': username/token do not match")
                             await websocket.send(json.dumps({
                                 "event":"register_error",
                                 "data":"invalid user"}))
@@ -1011,6 +1022,7 @@ async def ws_handler( websocket ):
                         await websocket.send( json.dumps({
                             "event":"register_success",
                             "data":client_info['session_token']}))
+                        print(f"{client_ip}: Register success for '{username}' user_id={user['id']} organization_id={user['organization_id']}")
                     else:
                         print(f"{client_ip}: Event '{event}'")
                         print(f"{client_ip}: Client not registered yet")
