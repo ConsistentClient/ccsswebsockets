@@ -418,8 +418,10 @@ async def send_general_notifcation_message( pool, user_id, organization_id, msg_
             device_tokens = notification_device_tokens(result, user_id, organization_id)
             if device_tokens is None:
                 return
-            invalid_tokens = send_device_notifications(
-                device_tokens, user_id, organization_id, msg_title, msg_body, data
+            # Push providers are called with blocking HTTP; keep the event loop free.
+            invalid_tokens = await asyncio.to_thread(
+                send_device_notifications,
+                device_tokens, user_id, organization_id, msg_title, msg_body, data,
             )
             if invalid_tokens:
                 notification_logger.warning(
@@ -446,8 +448,10 @@ async def send_notifcation_message( pool, user_id, organization_id, msg_title, m
             device_tokens = notification_device_tokens(result, user_id, organization_id)
             if device_tokens is None:
                 return
-            invalid_tokens = send_device_notifications(
-                device_tokens, user_id, organization_id, msg_title, msg_body, data
+            # Push providers are called with blocking HTTP; keep the event loop free.
+            invalid_tokens = await asyncio.to_thread(
+                send_device_notifications,
+                device_tokens, user_id, organization_id, msg_title, msg_body, data,
             )
             if invalid_tokens:
                 notification_logger.warning(
@@ -923,17 +927,36 @@ async def send_general_notification_msg_to_users( pool, message, user_id, organi
             else:
                 notification_logger.info("WebSocket notification sent: user_id=%s organization_id=%s", user_id, organization_id)
 
+_background_tasks = set()
+
+
+def _start_background(coro, description):
+    """Runs a coroutine without blocking the caller and logs any failure."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done(finished):
+        _background_tasks.discard(finished)
+        if not finished.cancelled() and finished.exception() is not None:
+            notification_logger.error(
+                "Background task failed: %s", description, exc_info=finished.exception()
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
 async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
     tasks = []
     for user_id in user_ids:
         found = False
-        for ws, info in connected_clients.items():
+        # A user can be connected from several places (web and app); deliver to each.
+        for ws, info in list(connected_clients.items()):
             ws_user_id = info.get("user_id")
             # Never deliver to a participant from another organization.
             if(user_id == ws_user_id and info.get("organization_id") == organization_id) :
                 found = True
                 tasks.append(ws.send(message))
-                break
         if found == False:
             if await can_send_message(pool, user_id, organization_id, room_id ):
                 await send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you", room_id )
@@ -1531,13 +1554,17 @@ async def ws_handler( websocket ):
                             "msginfo": data['msginfo'],
                         }
                     })
-                    await send_msg_to_users( pool, broadcast_data, user_ids, organization_id, room_id )
-
+                    # The message is saved: confirm to the sender first, then deliver and
+                    # notify in the background so slow pushes cannot delay or lose the reply.
                     await websocket.send(json.dumps({
                             "event":"broadcast_message_response",
                             "status": True,
                             "msgid": id
                         }))
+                    _start_background(
+                        send_msg_to_users( pool, broadcast_data, user_ids, organization_id, room_id ),
+                        f"deliver message {id} in room {room_id}",
+                    )
 
             except Exception as outer_err:
                 # Catch websocket errors (disconnects, etc.)
