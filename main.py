@@ -520,8 +520,10 @@ async def store_new_message (pool, user_id, message, msginfo, room_id, organizat
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cursor:
             await cursor.execute("INSERT INTO room_messages (room_id, user_id, organization_id, message, message_information) VALUES( %s, %s, %s, %s, %s)", (room_id, user_id, int( organization_id), message, msginfo))       
-            await cursor.execute("UPDATE rooms SET last_message_at = NOW() WHERE id = %s", (room_id,))
+            # Read the new id before any other statement: lastrowid is per statement,
+            # and the UPDATE below would reset it to 0.
             msg_id = cursor.lastrowid
+            await cursor.execute("UPDATE rooms SET last_message_at = NOW() WHERE id = %s", (room_id,))
             return msg_id
 
 async def edit_message_in_room (pool, user_id, msg_id, message, msginfo, room_id, organization_id):
@@ -947,6 +949,7 @@ def _start_background(coro, description):
 
 
 async def send_msg_to_users( pool, message, user_ids, organization_id, room_id ):
+    started = time.monotonic()
     tasks = []
     for user_id in user_ids:
         found = False
@@ -959,9 +962,16 @@ async def send_msg_to_users( pool, message, user_ids, organization_id, room_id )
                 tasks.append(ws.send(message))
         if found == False:
             if await can_send_message(pool, user_id, organization_id, room_id ):
+                push_started = time.monotonic()
                 await send_notifcation_message( pool, user_id, organization_id, "New Message", "A new chat message is sent to you", room_id )
+                print(f"[ChatDebug] room {room_id}: user {user_id} offline, push sent in {(time.monotonic() - push_started) * 1000:.0f} ms", flush=True)
+            else:
+                print(f"[ChatDebug] room {room_id}: user {user_id} offline, push skipped (muted or sent recently)", flush=True)
     if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        failures = [r for r in results if isinstance(r, Exception)]
+        print(f"[ChatDebug] room {room_id}: delivered to {len(tasks) - len(failures)} socket(s), {len(failures)} failed {failures[:3]}", flush=True)
+    print(f"[ChatDebug] room {room_id}: delivery finished in {(time.monotonic() - started) * 1000:.0f} ms", flush=True)
 
 # WebSocket server
 async def send_call_notification(websocket, payload):
@@ -1516,9 +1526,12 @@ async def ws_handler( websocket ):
                     
                 ## got the event and payload
                 if event == "BroadcastMessage":
+                    started = time.monotonic()
                     data = theMessageContent.get("data")
                     session_token = data['session_token']
+                    print(f"[ChatDebug] BroadcastMessage from user={client_info.get('user_id')} ({client_info.get('username')}) room={data.get('room')} socket={client_ip}:{client_port}", flush=True)
                     if client_info['session_token'] != session_token :
+                        print(f"[ChatDebug] BroadcastMessage rejected: session token does not match this socket", flush=True)
                         await websocket.send(json.dumps({
                             "error":"invalid token",
                             "data":"Session token is invalid"
@@ -1534,6 +1547,7 @@ async def ws_handler( websocket ):
                     if user_id in user_ids:
                         user_ids.remove(user_id)
                     else:
+                        print(f"[ChatDebug] BroadcastMessage rejected: user {user_id} is not in room {room_id} (members={user_ids})", flush=True)
                         await websocket.send(json.dumps({
                             "event":"broadcast_message_response",
                             "status": False
@@ -1542,6 +1556,7 @@ async def ws_handler( websocket ):
 
                     #store the msg for offline users
                     id = await store_new_message(pool, user_id, data['message'], data['msginfo'], room_id, client_info['organization_id'])
+                    print(f"[ChatDebug] message {id} saved in room {room_id} after {(time.monotonic() - started) * 1000:.0f} ms; recipients={user_ids}", flush=True)
 
                     #broadcast it to online users
                     broadcast_data = json.dumps({
@@ -1561,6 +1576,7 @@ async def ws_handler( websocket ):
                             "status": True,
                             "msgid": id
                         }))
+                    print(f"[ChatDebug] broadcast_message_response sent for message {id} after {(time.monotonic() - started) * 1000:.0f} ms", flush=True)
                     _start_background(
                         send_msg_to_users( pool, broadcast_data, user_ids, organization_id, room_id ),
                         f"deliver message {id} in room {room_id}",
